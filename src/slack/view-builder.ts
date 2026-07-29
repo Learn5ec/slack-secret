@@ -1,0 +1,284 @@
+export function buildSecretModal() {
+  return {
+    type: 'modal',
+    callback_id: 'secret_modal',
+    title: {
+      type: 'plain_text',
+      text: 'Share a Secret',
+      emoji: true,
+    },
+    submit: {
+      type: 'plain_text',
+      text: 'Send',
+      emoji: true,
+    },
+    close: {
+      type: 'plain_text',
+      text: 'Cancel',
+      emoji: true,
+    },
+    blocks: [
+      {
+        type: 'input',
+        block_id: 'recipient_block',
+        element: {
+          type: 'users_select',
+          placeholder: {
+            type: 'plain_text',
+            text: 'Select a recipient',
+            emoji: true,
+          },
+          action_id: 'recipient',
+        },
+        label: {
+          type: 'plain_text',
+          text: 'Recipient',
+          emoji: true,
+        },
+      },
+      {
+        type: 'input',
+        block_id: 'text_block',
+        element: {
+          type: 'plain_text_input',
+          multiline: true,
+          min_length: 1,
+          max_length: 3000,
+          action_id: 'secret_text',
+        },
+        label: {
+          type: 'plain_text',
+          text: 'Secret',
+          emoji: true,
+        },
+        optional: false,
+      },
+    ],
+  }
+}
+
+export function buildPlaceholderBlocks(secretType: 'text' | 'file', senderName: string, recipientName?: string | null, secretId?: string) {
+  const emoji = secretType === 'text' ? '🔒' : '📎'
+  const typeLabel = secretType === 'text' ? 'Secret' : 'File'
+
+  // For sender: show all 3 buttons (View, Viewed By, Revoke)
+  const headerText = recipientName
+    ? `${emoji} *${senderName} shared a ${typeLabel.toLowerCase()} with ${recipientName}*\nClick View Secret to open.`
+    : `${emoji} *${typeLabel} from ${senderName}*\nTap the button to reveal.`
+
+  return [
+    {
+      type: 'section',
+      text: {
+        type: 'mrkdwn',
+        text: headerText,
+      },
+    },
+    {
+      type: 'actions',
+      block_id: 'secret_actions',
+      elements: [
+        {
+          type: 'button',
+          text: {
+            type: 'plain_text',
+            text: '🔓 View Secret',
+            emoji: true,
+          },
+          style: 'primary',
+          action_id: 'secret:view',
+          value: secretId || '',
+        },
+        {
+          type: 'button',
+          text: {
+            type: 'plain_text',
+            text: '👁 Viewed By',
+            emoji: true,
+          },
+          action_id: 'secret:viewed-by',
+          value: secretId || '',
+        },
+        {
+          type: 'button',
+          text: {
+            type: 'plain_text',
+            text: '🗑 Revoke',
+            emoji: true,
+          },
+          style: 'danger',
+          action_id: 'secret:cancel',
+          value: secretId || '',
+        },
+      ],
+    },
+  ]
+}
+
+export function buildRecipientPlaceholderBlocks(secretType: 'text' | 'file', senderName: string, recipientName?: string | null, secretId?: string) {
+  const emoji = secretType === 'text' ? '🔒' : '📎'
+  const typeLabel = secretType === 'text' ? 'Secret' : 'File'
+
+  // For recipient: show only View Secret button
+  const headerText = recipientName
+    ? `${emoji} *${senderName} shared a ${typeLabel.toLowerCase()} with you*\nClick View Secret to open.`
+    : `${emoji} *${typeLabel} from ${senderName}*\nClick View Secret to open.`
+
+  return [
+    {
+      type: 'section',
+      text: {
+        type: 'mrkdwn',
+        text: headerText,
+      },
+    },
+    {
+      type: 'actions',
+      block_id: 'secret_actions',
+      elements: [
+        {
+          type: 'button',
+          text: {
+            type: 'plain_text',
+            text: '🔓 View Secret',
+            emoji: true,
+          },
+          style: 'primary',
+          action_id: 'secret:view',
+          value: secretId || '',
+        },
+      ],
+    },
+  ]
+}
+
+export function buildViewedPlaceholderBlocks(secretType: 'text' | 'file', viewerCount: number) {
+  const emoji = secretType === 'text' ? '🔓' : '📎'
+  const typeLabel = secretType === 'text' ? 'Secret' : 'File'
+
+  if (viewerCount === 1) {
+    return [
+      {
+        type: 'section',
+        text: {
+          type: 'mrkdwn',
+          text: `${emoji} *${typeLabel} viewed.*`,
+        },
+      },
+    ]
+  }
+
+  return [
+    {
+      type: 'section',
+      text: {
+        type: 'mrkdwn',
+        text: `${emoji} *${typeLabel}* — viewed by ${viewerCount} people so far.`,
+      },
+    },
+  ]
+}
+
+export function buildCancelledPlaceholderBlocks(secretType: 'text' | 'file') {
+  const emoji = secretType === 'text' ? '🔒' : '📎'
+  const typeLabel = secretType === 'text' ? 'Secret' : 'File'
+
+  return [
+    {
+      type: 'section',
+      text: {
+        type: 'mrkdwn',
+        text: `${emoji} *${typeLabel} cancelled.*`,
+      },
+    },
+  ]
+}
+
+export function buildExpiredPlaceholderBlocks(secretType: 'text' | 'file') {
+  const emoji = secretType === 'text' ? '🔒' : '📎'
+  const typeLabel = secretType === 'text' ? 'Secret' : 'File'
+
+  return [
+    {
+      type: 'section',
+      text: {
+        type: 'mrkdwn',
+        text: `${emoji} *${typeLabel}* expired, unopened.`,
+      },
+    },
+  ]
+}
+
+export function buildViewedByBlocks(viewerList: Array<{ name: string; deliveredAt: string }>) {
+  if (viewerList.length === 0) {
+    return [
+      {
+        type: 'section',
+        text: {
+          type: 'mrkdwn',
+          text: 'No one has viewed this secret yet.',
+        },
+      },
+    ]
+  }
+
+  const items = viewerList.map((v) => `• ${v.name} — ${v.deliveredAt}`)
+  return [
+    {
+      type: 'section',
+      text: {
+        type: 'mrkdwn',
+        text: `*Viewed by:*\n${items.join('\n')}`,
+      },
+    },
+  ]
+}
+
+export function buildRevealedSecretBlocks(headerText: string, secretBlocks: any[], secretId: string) {
+  return [
+    {
+      type: 'section',
+      text: {
+        type: 'mrkdwn',
+        text: `${headerText}\n_🔒 Only visible to you._`,
+      },
+    },
+    ...secretBlocks,
+    {
+      type: 'actions',
+      block_id: 'secret_revealed_actions',
+      elements: [
+        {
+          type: 'button',
+          text: {
+            type: 'plain_text',
+            text: '🙈 Hide Secret',
+            emoji: true,
+          },
+          style: 'danger',
+          action_id: 'secret:hide',
+          value: secretId,
+        },
+      ],
+    },
+  ]
+}
+
+export function buildPermanentAnnouncementBlocks(secretType: 'text' | 'file', senderName: string, recipientName?: string | null) {
+  const emoji = secretType === 'text' ? '🔒' : '📎'
+  const typeLabel = secretType === 'text' ? 'Secret' : 'File'
+
+  const headerText = recipientName
+    ? `${emoji} *${senderName} sent a ${typeLabel.toLowerCase()} to ${recipientName}*`
+    : `${emoji} *${senderName} sent a ${typeLabel.toLowerCase()}*`
+
+  return [
+    {
+      type: 'section',
+      text: {
+        type: 'mrkdwn',
+        text: headerText,
+      },
+    },
+  ]
+}

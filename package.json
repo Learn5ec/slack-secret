@@ -1,0 +1,36 @@
+{
+  "name": "secret-bot",
+  "version": "1.0.0",
+  "description": "Self-destructing secrets and files for Slack (view-once, download-once, per-user)",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "tsx watch src/index.ts",
+    "migrate": "tsx bin/migrate.ts",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "gen-key": "tsx src/crypto/keys/generate-key.ts"
+  },
+  "dependencies": {
+    "@slack/bolt": "^3.16.0",
+    "@slack/web-api": "^6.12.0",
+    "bullmq": "^5.12.0",
+    "dotenv": "^17.4.2",
+    "ioredis": "^5.4.1",
+    "libsodium-wrappers": "^0.7.13",
+    "node-pg-migrate": "^7.5.0",
+    "pg": "^8.12.0",
+    "pino": "^9.4.0",
+    "zod": "^3.23.0"
+  },
+  "devDependencies": {
+    "@types/ioredis": "^5.0.0",
+    "@types/libsodium-wrappers": "^0.7.13",
+    "@types/node": "^22.7.0",
+    "@types/pg": "^8.11.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0",
+    "vitest": "^2.1.0"
+  }
+}
