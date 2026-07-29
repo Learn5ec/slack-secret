@@ -1,0 +1,1 @@
+{"nodes": [{"id": "plan", "label": "Implementation Plan: secret-bot", "file_type": "document", "source_file": "plan.md"}], "edges": [{"source": "plan", "target": "idea", "relation": "implements", "confidence": "EXTRACTED", "confidence_score": 1.0, "source_file": "plan.md"}], "hyperedges": []}
