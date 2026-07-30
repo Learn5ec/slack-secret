@@ -14,9 +14,12 @@ const envSchema = z.object({
   POSTGRES_USER: z.string().default('secret_bot'),
   POSTGRES_PASSWORD: z.string().min(1),
   REDIS_URL: z.string().default('redis://localhost:6379'),
-  MASTER_KEY_FILE: z.string().default('./src/crypto/keys/master.key.age'),
-  MASTER_KEY_PASSPHRASE: z.string().optional(),
+  MASTER_KEY_FILE: z.string().default('./src/crypto/keys/master.key'),
   LOG_LEVEL: z.enum(['trace', 'debug', 'info', 'warn', 'error', 'fatal']).default('info'),
+  HEALTH_PORT: z.coerce.number().default(9090),
+  FILE_SIZE_MAX: z.coerce.number().default(25 * 1024 * 1024), // 25MB
+  AV_ENABLED: z.coerce.boolean().default(true),
+  STORAGE_DIR: z.string().default('./encrypted-storage'),
 })
 
 export type Config = z.infer<typeof envSchema>
