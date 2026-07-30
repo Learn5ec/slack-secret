@@ -6,3 +6,10 @@ src/crypto/keys/
 *.key
 *.key.age
 *.log
+logs/
+encrypted-storage/
+
+# Only README.md is committed - everything else markdown is local-only
+# (planning docs, AI-assistant instructions, generated reports, etc.)
+*.md
+!/README.md

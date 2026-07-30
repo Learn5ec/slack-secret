@@ -48,18 +48,40 @@ export function buildSecretModal() {
         },
         label: {
           type: 'plain_text',
-          text: 'Secret',
+          text: 'Secret Text',
           emoji: true,
         },
-        optional: false,
+        optional: true,
+      },
+      {
+        type: 'input',
+        block_id: 'file_block',
+        element: {
+          type: 'file_input',
+          action_id: 'file_input',
+          max_files: 1,
+        },
+        label: {
+          type: 'plain_text',
+          text: 'File',
+          emoji: true,
+        },
+        optional: true,
       },
     ],
   }
 }
 
-export function buildPlaceholderBlocks(secretType: 'text' | 'file', senderName: string, recipientName?: string | null, secretId?: string) {
-  const emoji = secretType === 'text' ? '🔒' : '📎'
-  const typeLabel = secretType === 'text' ? 'Secret' : 'File'
+type SecretType = 'text' | 'file' | 'combined'
+
+function describeSecretType(secretType: SecretType): { emoji: string; typeLabel: string } {
+  if (secretType === 'text') return { emoji: '🔒', typeLabel: 'Secret' }
+  if (secretType === 'file') return { emoji: '📎', typeLabel: 'File' }
+  return { emoji: '🔒📎', typeLabel: 'Secret + File' }
+}
+
+export function buildPlaceholderBlocks(secretType: SecretType, senderName: string, recipientName?: string | null, secretId?: string) {
+  const { emoji, typeLabel } = describeSecretType(secretType)
 
   // For sender: show all 3 buttons (View, Viewed By, Revoke)
   const headerText = recipientName
@@ -115,9 +137,8 @@ export function buildPlaceholderBlocks(secretType: 'text' | 'file', senderName: 
   ]
 }
 
-export function buildRecipientPlaceholderBlocks(secretType: 'text' | 'file', senderName: string, recipientName?: string | null, secretId?: string) {
-  const emoji = secretType === 'text' ? '🔒' : '📎'
-  const typeLabel = secretType === 'text' ? 'Secret' : 'File'
+export function buildRecipientPlaceholderBlocks(secretType: SecretType, senderName: string, recipientName?: string | null, secretId?: string) {
+  const { emoji, typeLabel } = describeSecretType(secretType)
 
   // For recipient: show only View Secret button
   const headerText = recipientName
@@ -152,9 +173,9 @@ export function buildRecipientPlaceholderBlocks(secretType: 'text' | 'file', sen
   ]
 }
 
-export function buildViewedPlaceholderBlocks(secretType: 'text' | 'file', viewerCount: number) {
-  const emoji = secretType === 'text' ? '🔓' : '📎'
-  const typeLabel = secretType === 'text' ? 'Secret' : 'File'
+export function buildViewedPlaceholderBlocks(secretType: SecretType, viewerCount: number) {
+  const { typeLabel } = describeSecretType(secretType)
+  const emoji = secretType === 'file' ? '📎' : '🔓'
 
   if (viewerCount === 1) {
     return [
@@ -179,9 +200,8 @@ export function buildViewedPlaceholderBlocks(secretType: 'text' | 'file', viewer
   ]
 }
 
-export function buildCancelledPlaceholderBlocks(secretType: 'text' | 'file') {
-  const emoji = secretType === 'text' ? '🔒' : '📎'
-  const typeLabel = secretType === 'text' ? 'Secret' : 'File'
+export function buildCancelledPlaceholderBlocks(secretType: SecretType) {
+  const { emoji, typeLabel } = describeSecretType(secretType)
 
   return [
     {
@@ -194,9 +214,8 @@ export function buildCancelledPlaceholderBlocks(secretType: 'text' | 'file') {
   ]
 }
 
-export function buildExpiredPlaceholderBlocks(secretType: 'text' | 'file') {
-  const emoji = secretType === 'text' ? '🔒' : '📎'
-  const typeLabel = secretType === 'text' ? 'Secret' : 'File'
+export function buildExpiredPlaceholderBlocks(secretType: SecretType) {
+  const { emoji, typeLabel } = describeSecretType(secretType)
 
   return [
     {
@@ -264,9 +283,8 @@ export function buildRevealedSecretBlocks(headerText: string, secretBlocks: any[
   ]
 }
 
-export function buildPermanentAnnouncementBlocks(secretType: 'text' | 'file', senderName: string, recipientName?: string | null) {
-  const emoji = secretType === 'text' ? '🔒' : '📎'
-  const typeLabel = secretType === 'text' ? 'Secret' : 'File'
+export function buildPermanentAnnouncementBlocks(secretType: SecretType, senderName: string, recipientName?: string | null) {
+  const { emoji, typeLabel } = describeSecretType(secretType)
 
   const headerText = recipientName
     ? `${emoji} *${senderName} sent a ${typeLabel.toLowerCase()} to ${recipientName}*`
