@@ -8,6 +8,10 @@ src/crypto/keys/
 *.log
 logs/
 encrypted-storage/
+.claude/
+graphify/
+graphify-out/
+bug-tracker.csv
 
 # Only README.md is committed - everything else markdown is local-only
 # (planning docs, AI-assistant instructions, generated reports, etc.)
