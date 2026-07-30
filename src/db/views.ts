@@ -6,8 +6,8 @@ export type ViewRow = {
   viewer_id: string
   dm_channel_id: string | null
   dm_ts: string | null
-  ephemeral_ts: string | null
-  response_url: string | null
+  file_dm_ts: string | null
+  file_upload_id: string | null
   delivered_at: Date | null
   delete_at: Date | null
   status: 'delivered' | 'deleted' | 'failed'
@@ -19,15 +19,17 @@ export function createClient(pool: Pool) {
     secretId: string
     viewerId: string
     dmChannelId: string
-    dmTs: string
+    dmTs: string | null
+    fileDmTs?: string | null
+    fileUploadId?: string | null
     deleteAt: Date
   }): Promise<{ created: boolean; view: ViewRow | null }> => {
     const result = await pool.query(
-      `INSERT INTO views (secret_id, viewer_id, dm_channel_id, dm_ts, delivered_at, delete_at, status)
-       VALUES ($1, $2, $3, $4, now(), $5, 'delivered')
+      `INSERT INTO views (secret_id, viewer_id, dm_channel_id, dm_ts, file_dm_ts, file_upload_id, delivered_at, delete_at, status)
+       VALUES ($1, $2, $3, $4, $5, $6, now(), $7, 'delivered')
        ON CONFLICT (secret_id, viewer_id) DO NOTHING
        RETURNING *`,
-      [params.secretId, params.viewerId, params.dmChannelId, params.dmTs, params.deleteAt],
+      [params.secretId, params.viewerId, params.dmChannelId, params.dmTs, params.fileDmTs ?? null, params.fileUploadId ?? null, params.deleteAt],
     )
     if (result.rows.length === 0) {
       return { created: false, view: null }
@@ -54,10 +56,10 @@ export function createClient(pool: Pool) {
   // Re-open a previously hidden/deleted view within its original delete_at
   // window - delete_at is NOT extended, the viewing window is fixed from the
   // first view.
-  reopenView: async (viewId: string, dmChannelId: string, dmTs: string): Promise<void> => {
+  reopenView: async (viewId: string, dmChannelId: string, dmTs: string | null, fileDmTs?: string | null, fileUploadId?: string | null): Promise<void> => {
     await pool.query(
-      "UPDATE views SET dm_channel_id = $1, dm_ts = $2, status = 'delivered' WHERE id = $3",
-      [dmChannelId, dmTs, viewId],
+      "UPDATE views SET dm_channel_id = $1, dm_ts = $2, file_dm_ts = $3, file_upload_id = $4, status = 'delivered' WHERE id = $5",
+      [dmChannelId, dmTs, fileDmTs ?? null, fileUploadId ?? null, viewId],
     )
   },
 
