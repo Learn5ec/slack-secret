@@ -1,15 +1,17 @@
 import { WebClient } from '@slack/web-api'
 import { logger } from '../utils/logger'
-import { decryptSecret } from '../crypto/secret'
+import { decryptSecret, decryptFile } from '../crypto/secret'
 import { getMasterKey } from '../crypto/master'
 import { createDatabases } from '../db'
 import { pool } from '../db/client'
 import { buildViewedByBlocks, buildRevealedSecretBlocks } from '../slack/view-builder'
-import { deleteSlackMessage } from '../slack/messages'
+import { deleteSlackMessage, deleteSlackFile } from '../slack/messages'
 import { deleteDmMessageQueue } from '../queue/client'
 import { getConfig } from '../config/timing'
 import { markdownToSlackBlocks } from '../markdown/converter'
 import { formatIST } from '../utils/time'
+import { readLocalFile } from '../utils/file-ops'
+import { purgeSecret } from './secret-cleanup'
 
 type ActionBody = {
   user: { id: string }
@@ -156,33 +158,117 @@ async function handleViewFlow(params: {
       return
     }
 
-    // Decrypt using proper envelope
-    const envelope = {
-      version: 1 as const,
-      algorithm: 'xsalsa20poly1305' as const,
-      nonce: Buffer.from(secret.iv).toString('base64'),
-      ciphertext: Buffer.from(secret.ciphertext).toString('base64'),
-      encryptedDataKey: secret.encrypted_data_key ? Buffer.from(secret.encrypted_data_key).toString('base64') : '',
+    const masterKey = await getMasterKey()
+
+    // Text and file are independent - a 'combined' secret delivers BOTH as
+    // separate messages in the same DM, tracked as dm_ts (text) / file_dm_ts
+    // (file) on one view row so either can be deleted on its own.
+    let textTs: string | undefined
+    let fileTs: string | undefined
+    let fileUploadId: string | undefined
+
+    if (secret.ciphertext) {
+      const envelope = {
+        version: 1 as const,
+        algorithm: 'xsalsa20poly1305' as const,
+        nonce: Buffer.from(secret.iv).toString('base64'),
+        ciphertext: Buffer.from(secret.ciphertext).toString('base64'),
+        encryptedDataKey: secret.encrypted_data_key ? Buffer.from(secret.encrypted_data_key).toString('base64') : '',
+      }
+
+      const plaintext = await decryptSecret(envelope, masterKey)
+      const secretBlocks = markdownToSlackBlocks(plaintext)
+      const blocks = buildRevealedSecretBlocks(headerText, secretBlocks, secret.id)
+
+      const textResult = await client.chat.postMessage({
+        channel: dmChannelId,
+        text: postText,
+        blocks,
+      })
+
+      if (textResult.ok && textResult.ts) {
+        textTs = textResult.ts
+      } else {
+        logger.warn({ secretId: secret.id, viewerId, err: textResult.error }, 'Failed to send secret text DM')
+      }
     }
 
-    const plaintext = await decryptSecret(envelope, await getMasterKey())
-    const secretBlocks = markdownToSlackBlocks(plaintext)
-    const blocks = buildRevealedSecretBlocks(headerText, secretBlocks, secret.id)
+    if (secret.file_path) {
+      const fileBuffer = await readLocalFile(secret.file_path)
+      const fileEnvelope = {
+        version: 1 as const,
+        algorithm: 'xsalsa20poly1305' as const,
+        nonce: Buffer.from(secret.file_iv).toString('base64'),
+        ciphertext: fileBuffer.toString('base64'),
+        encryptedDataKey: secret.file_encrypted_data_key ? Buffer.from(secret.file_encrypted_data_key).toString('base64') : '',
+      }
 
-    const postResult = await client.chat.postMessage({
-      channel: dmChannelId,
-      text: postText,
-      blocks,
-    })
+      const decryptedFile = await decryptFile(fileEnvelope, masterKey)
 
-    if (!postResult.ok || !postResult.ts) {
-      logger.warn({ secretId: secret.id, viewerId, err: postResult.error }, 'Failed to send secret DM')
+      const uploadResult: any = await client.files.uploadV2({
+        channel_id: dmChannelId,
+        file: decryptedFile,
+        filename: secret.file_name || 'file',
+        title: secret.file_name || 'file',
+      })
+
+      if (uploadResult.ok) {
+        // files.uploadV2 wraps files.completeUploadExternal, whose result is
+        // double-nested (uploadResult.files[0].files[0] is the actual file
+        // object). The message ts for a shared file lives on that file
+        // object's `shares.private`/`shares.public`, keyed by channel id -
+        // there is no top-level ts on the uploadV2 result itself.
+        const innerFile = uploadResult.files?.[0]?.files?.[0]
+        const shareEntry = innerFile?.shares?.private?.[dmChannelId]?.[0] || innerFile?.shares?.public?.[dmChannelId]?.[0]
+        fileTs = shareEntry?.ts
+        fileUploadId = innerFile?.id
+
+        if (!fileTs) {
+          logger.warn({ secretId: secret.id, viewerId, innerFile }, 'File uploaded but no message ts could be found - it cannot be auto-deleted')
+        }
+      } else {
+        logger.warn({ secretId: secret.id, viewerId, err: uploadResult.error }, 'Failed to upload secret file')
+      }
+    }
+
+    // files.uploadV2 has no way to attach interactive blocks to the file-share
+    // message itself, so a file-only secret would otherwise have no Hide
+    // Secret button anywhere. Send a small companion message carrying just
+    // that button (reusing the same dm_ts/text-message tracking, so Hide/
+    // Revoke/the auto-delete timer all pick it up with no extra plumbing).
+    // Not needed when there's also text content - that message already has
+    // its own embedded Hide button covering the whole view.
+    if (secret.file_path && !secret.ciphertext) {
+      const companionBlocks = buildRevealedSecretBlocks(`${headerText}\nYour file is ready above.`, [], secret.id)
+      const companionResult = await client.chat.postMessage({
+        channel: dmChannelId,
+        text: postText,
+        blocks: companionBlocks,
+      })
+
+      if (companionResult.ok && companionResult.ts) {
+        textTs = companionResult.ts
+      } else {
+        logger.warn({ secretId: secret.id, viewerId, err: companionResult.error }, 'Failed to send Hide Secret companion message')
+      }
+    }
+
+    if (!textTs && !fileTs) {
+      logger.warn({ secretId: secret.id, viewerId }, 'Nothing was successfully delivered')
       return
     }
 
     if (existing) {
-      // Re-open within the original window - delete_at stays fixed from first view
-      await dbs.views.reopenView(existing.id, dmChannelId, postResult.ts)
+      // Re-open within the original window - delete_at stays fixed from first view.
+      // Keep whichever message ts wasn't re-delivered this time (e.g. only the
+      // text half failed to resend) rather than clobbering it with null.
+      await dbs.views.reopenView(
+        existing.id,
+        dmChannelId,
+        textTs ?? existing.dm_ts,
+        fileTs ?? existing.file_dm_ts,
+        fileUploadId ?? existing.file_upload_id,
+      )
 
       const deleteAt = new Date(existing.delete_at)
       const remainingMs = Math.max(1000, deleteAt.getTime() - now)
@@ -206,14 +292,18 @@ async function handleViewFlow(params: {
       secretId: secret.id,
       viewerId,
       dmChannelId,
-      dmTs: postResult.ts,
+      dmTs: textTs ?? null,
+      fileDmTs: fileTs ?? null,
+      fileUploadId: fileUploadId ?? null,
       deleteAt,
     })
 
     if (!result.created) {
-      // Lost a race with a concurrent click on the same button - clean up the duplicate post
-      logger.info({ secretId: secret.id, viewerId }, 'Lost race on view creation, removing duplicate post')
-      await deleteSlackMessage(client, dmChannelId, postResult.ts)
+      // Lost a race with a concurrent click on the same button - clean up the duplicate post(s)
+      logger.info({ secretId: secret.id, viewerId }, 'Lost race on view creation, removing duplicate post(s)')
+      if (textTs) await deleteSlackMessage(client, dmChannelId, textTs)
+      if (fileUploadId) await deleteSlackFile(client, fileUploadId)
+      if (fileTs) await deleteSlackMessage(client, dmChannelId, fileTs)
       return
     }
 
@@ -366,65 +456,13 @@ export async function handleCancelAction(args: ActionArgs): Promise<void> {
       return
     }
 
-    // Get all delivered views and delete any already-revealed secret messages
-    // (same shared deleteSlackMessage function the timer job and Hide button use)
-    const views = await dbs.views.getDeliveredViewsForSecret(secretId)
-    logger.info({ secretId, viewCount: views.length }, 'Found views for cancel')
-
-    for (const view of views) {
-      if (view.dm_channel_id && view.dm_ts) {
-        await deleteSlackMessage(client, view.dm_channel_id, view.dm_ts)
-        logger.info({ viewId: view.id }, 'Deleted revealed-secret message')
-      } else {
-        logger.warn({ viewId: view.id }, 'View has no dm_channel_id/dm_ts, cannot delete message')
-      }
-    }
-
-    // Cancel any pending delete jobs for this secret
-    const pendingJobs = await deleteDmMessageQueue.getJobs(['waiting', 'active', 'delayed'])
-    for (const job of pendingJobs) {
-      if (job.data.secretId === secretId) {
-        try {
-          await job.remove()
-          logger.info({ jobId: job.id, secretId }, 'Cancelled pending delete job')
-        } catch (err: any) {
-          logger.warn({ jobId: job.id, secretId, err: err.message }, 'Failed to cancel pending delete job')
-        }
-      }
-    }
-
-    // Mark all views as deleted
-    for (const view of views) {
-      await dbs.views.markViewAsDeleted(view.id)
-    }
-    logger.info({ secretId, viewCount: views.length }, 'Marked all views as deleted')
-
-    // Delete the recipient's "View Secret" DM placeholder, if one was sent
-    if (secret.recipient_dm_channel_id && secret.recipient_dm_ts) {
-      await deleteSlackMessage(client, secret.recipient_dm_channel_id, secret.recipient_dm_ts)
-      logger.info({ secretId }, 'Deleted recipient DM placeholder message')
-    }
-
-    // Delete any open "Viewed By" message, if one exists
-    if (secret.viewed_by_channel_id && secret.viewed_by_ts) {
-      await deleteSlackMessage(client, secret.viewed_by_channel_id, secret.viewed_by_ts)
-      logger.info({ secretId }, 'Deleted Viewed By message')
-    }
-
-    // Delete the sender's interactive placeholder message (NOT the permanent announcement)
+    // Prefer the live ts/channel from this click over the stored reference -
+    // it's guaranteed current, whereas the stored one exists mainly for the
+    // background expiry sweep, which has no click context to work from.
     const messageTs = body.message?.ts || (body as any).message_ts
     const channelId = body.channel?.id || (body as any).channel_id
 
-    if (messageTs && channelId) {
-      await deleteSlackMessage(client, channelId, messageTs)
-      logger.info({ secretId, channelId, messageTs }, 'Deleted interactive placeholder message')
-    } else {
-      logger.warn({ secretId, hasMessageTs: !!messageTs, hasChannelId: !!channelId }, 'Cannot delete placeholder - missing message ts or channel id')
-    }
-
-    // Hard-delete from DB
-    await dbs.secrets.hardDeleteSecretsForId(secretId)
-    logger.info({ secretId }, 'Secret hard-deleted from DB')
+    await purgeSecret(client, dbs, secret, messageTs && channelId ? { channelId, ts: messageTs } : undefined)
   } catch (err: any) {
     logger.error({ err, secretId, userId }, 'Error in Cancel action')
   }
@@ -451,10 +489,20 @@ export async function handleHideAction(args: ActionArgs): Promise<void> {
       return
     }
 
-    if (userView.dm_channel_id && userView.dm_ts) {
-      await deleteSlackMessage(client, userView.dm_channel_id, userView.dm_ts)
+    if (!userView.dm_channel_id) {
+      logger.warn({ secretId, userId, viewId: userView.id }, 'View has no dm_channel_id, cannot delete message(s)')
     } else {
-      logger.warn({ secretId, userId, viewId: userView.id }, 'View has no dm_channel_id/dm_ts, cannot delete message')
+      if (userView.dm_ts) {
+        await deleteSlackMessage(client, userView.dm_channel_id, userView.dm_ts)
+      }
+      if (userView.file_upload_id) {
+        // Purge the actual file object first - re-opening later (if within
+        // the original window) re-uploads a fresh copy from our own storage.
+        await deleteSlackFile(client, userView.file_upload_id)
+      }
+      if (userView.file_dm_ts) {
+        await deleteSlackMessage(client, userView.dm_channel_id, userView.file_dm_ts)
+      }
     }
 
     await dbs.views.markViewAsDeleted(userView.id)
