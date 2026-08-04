@@ -9,7 +9,7 @@ import { processPurgeExpiredSecret } from './queue/expiry-job'
 import { slackClient } from './slack/client'
 import { handleSecretCommand } from './bot/commands'
 import { handleModalSubmit } from './bot/modals'
-import { handleViewAction, handleViewedByAction, handleCancelAction, handleHideAction } from './bot/actions'
+import { handleViewAction, handleViewedByAction, handleCancelAction, handleHideAction, handleRevokeConfirm } from './bot/actions'
 import { purgeSecret } from './bot/secret-cleanup'
 import { startConfigPolling, stopConfigPolling, getConfig } from './config/timing'
 import { initHealthCheck, closeHealthCheck } from './health'
@@ -144,6 +144,26 @@ async function main() {
       ack: args.ack,
       body: args.body as any,
       client: args.client as any,
+      trigger_id: (args.action as any).trigger_id,
+    })
+  })
+
+  // Register modal submission handler for the revoke confirmation
+  app.view('revoke_confirm', async ({ view, ack, body, client }) => {
+    const secretId = (view as any).private_metadata
+    const userId = (body.user as any)?.id
+
+    if (!secretId) {
+      logger.warn('Revoke confirm: no secretId in modal metadata')
+      return
+    }
+
+    logger.info({ secretId, userId }, 'Revoke confirm: modal submitted')
+    await handleRevokeConfirm({
+      secretId,
+      userId,
+      trigger_id: (body as any).trigger_id || '',
+      client: client as any,
     })
   })
 
