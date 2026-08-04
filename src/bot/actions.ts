@@ -368,7 +368,7 @@ export async function handleViewedByAction(args: ActionArgs): Promise<void> {
     const views = await dbs.views.getViewsBySecretId(secretId)
 
     // Build viewer list
-     const viewerList = views.map((view: any) => {
+    const viewerList = views.map((view: any) => {
       const name = `<@${view.viewer_id}>`
       const deliveredAt = view.delivered_at
         ? formatIST(new Date(view.delivered_at))
@@ -521,11 +521,15 @@ export async function handleRevokeConfirm(args: {
 
     if (postResult.ok && postResult.ts) {
       try {
-        // purgeSecret will also delete this "Processing..." message via the
-        // placeholder param, so we don't need to delete it separately.
-        await purgeSecret(client, dbs, secret, { channelId: dmChannelId, ts: postResult.ts })
+        // Don't pass this "Processing..." message as the placeholder - that
+        // would make purgeSecret delete it instead of the real interactive
+        // placeholder (secret.sender_placeholder_channel_id/ts). Delete it
+        // separately once purging is done.
+        await purgeSecret(client, dbs, secret)
       } catch (err: any) {
         logger.error({ err, secretId }, 'Error during revocation')
+      } finally {
+        await deleteSlackMessage(client, dmChannelId, postResult.ts)
       }
     } else {
       logger.warn({ secretId, err: postResult.error }, 'Failed to post processing message')
