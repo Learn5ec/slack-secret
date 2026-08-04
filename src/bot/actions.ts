@@ -4,7 +4,7 @@ import { decryptSecret, decryptFile } from '../crypto/secret'
 import { getMasterKey } from '../crypto/master'
 import { createDatabases } from '../db'
 import { pool } from '../db/client'
-import { buildViewedByBlocks, buildRevealedSecretBlocks } from '../slack/view-builder'
+import { buildViewedByBlocks, buildRevealedSecretBlocks, buildRevokeConfirmationModal } from '../slack/view-builder'
 import { deleteSlackMessage, deleteSlackFile } from '../slack/messages'
 import { deleteDmMessageQueue } from '../queue/client'
 import { getConfig } from '../config/timing'
@@ -36,6 +36,7 @@ type ActionArgs = {
   body: ActionBody
   client: WebClient
   respond?: (response: any) => Promise<any>
+  trigger_id?: string
 }
 
 export async function handleViewAction(args: ActionArgs): Promise<void> {
@@ -439,32 +440,100 @@ export async function handleCancelAction(args: ActionArgs): Promise<void> {
 
   logger.info({ secretId, userId }, 'Cancel action triggered')
 
-  await ack()
-
   try {
     const dbs = createDatabases(pool)
     const secret = await dbs.secrets.getSecretById(secretId)
 
     if (!secret) {
       logger.warn({ secretId }, 'Secret not found')
+      await notifyViewer(client, body, userId, '🔒 Secret not found.')
+      await ack()
       return
     }
 
-    // Only sender can cancel
+    // Only sender can cancel - check before opening the modal
     if (userId !== secret.sender_id) {
       logger.warn({ userId, secretId }, 'Non-sender attempted Cancel')
+      await notifyViewer(client, body, userId, '🔒 Only the sender can revoke this secret.')
+      await ack()
       return
     }
 
-    // Prefer the live ts/channel from this click over the stored reference -
-    // it's guaranteed current, whereas the stored one exists mainly for the
-    // background expiry sweep, which has no click context to work from.
-    const messageTs = body.message?.ts || (body as any).message_ts
-    const channelId = body.channel?.id || (body as any).channel_id
-
-    await purgeSecret(client, dbs, secret, messageTs && channelId ? { channelId, ts: messageTs } : undefined)
+    // Open a confirmation modal instead of immediately revoking
+    await client.views.open({
+      trigger_id: args.trigger_id!,
+      view: buildRevokeConfirmationModal(secretId) as any,
+    })
+    // Don't ack() here - we're not responding to the interaction, we're
+    // opening a modal. Ack will happen when the user submits the modal.
   } catch (err: any) {
-    logger.error({ err, secretId, userId }, 'Error in Cancel action')
+    logger.error({ err, secretId, userId }, 'Failed to open revoke confirmation modal')
+    await ack()
+  }
+}
+
+export async function handleRevokeConfirm(args: {
+  secretId: string
+  userId: string
+  trigger_id: string
+  client: WebClient
+}): Promise<void> {
+  const { secretId, userId, client } = args
+
+  logger.info({ secretId, userId }, 'Revoke confirm: processing')
+
+  try {
+    const dbs = createDatabases(pool)
+    const secret = await dbs.secrets.getSecretById(secretId)
+
+    if (!secret) {
+      logger.warn({ secretId }, 'Secret not found on confirm')
+      return
+    }
+
+    // Double-check: only sender can revoke
+    if (userId !== secret.sender_id) {
+      logger.warn({ userId, secretId }, 'Non-sender attempted to confirm revoke')
+      return
+    }
+
+    // Open DM with sender and post a "Processing..." message so they see
+    // something happening while purgeSecret works in the background.
+    const dmResult = await client.conversations.open({ users: userId })
+    const dmChannelId = dmResult.channel?.id
+
+    if (!dmChannelId) {
+      logger.error({ secretId, userId }, 'Failed to open DM for revoke confirmation')
+      return
+    }
+
+    const postResult = await client.chat.postMessage({
+      channel: dmChannelId,
+      text: 'Revoking...',
+      blocks: [
+        {
+          type: 'section',
+          text: {
+            type: 'mrkdwn',
+            text: '⏳ *Revoking secret...* This may take a moment.',
+          },
+        },
+      ],
+    })
+
+    if (postResult.ok && postResult.ts) {
+      try {
+        // purgeSecret will also delete this "Processing..." message via the
+        // placeholder param, so we don't need to delete it separately.
+        await purgeSecret(client, dbs, secret, { channelId: dmChannelId, ts: postResult.ts })
+      } catch (err: any) {
+        logger.error({ err, secretId }, 'Error during revocation')
+      }
+    } else {
+      logger.warn({ secretId, err: postResult.error }, 'Failed to post processing message')
+    }
+  } catch (err: any) {
+    logger.error({ err, secretId, userId }, 'Error in revoke confirm flow')
   }
 }
 

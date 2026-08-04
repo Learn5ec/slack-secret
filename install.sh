@@ -231,30 +231,55 @@ as_postgres() {
   fi
 }
 
-if command -v psql >/dev/null 2>&1 && { $HAS_SUDO || $IS_ROOT; } && as_postgres psql -tAc '\q' >/dev/null 2>&1; then
-  ROLE_EXISTS="$(as_postgres psql -tAc "SELECT 1 FROM pg_roles WHERE rolname='${POSTGRES_USER}'" 2>/dev/null | tr -d '[:space:]')"
+# Actually attempt the setup rather than just probing first - sudo/psql are
+# left interactive here (no output redirection on the commands that matter)
+# so a needed sudo password prompt shows up normally and any real connection
+# error is visible, instead of silently diverting to manual instructions.
+PG_READY=false
+if command -v psql >/dev/null 2>&1 && $CAN_ELEVATE; then
+  info "Setting up the Postgres role and database - enter your sudo password if asked."
+
+  ROLE_EXISTS="$(as_postgres psql -tAc "SELECT 1 FROM pg_roles WHERE rolname='${POSTGRES_USER}'" 2>/dev/null | tr -d '[:space:]')" || true
   if [ "$ROLE_EXISTS" = "1" ]; then
     log "Postgres role '${POSTGRES_USER}' already exists"
+    ROLE_READY=true
+  elif as_postgres psql -v ON_ERROR_STOP=1 -c "CREATE ROLE \"${POSTGRES_USER}\" WITH LOGIN PASSWORD '${POSTGRES_PASSWORD}';"; then
+    log "Created Postgres role '${POSTGRES_USER}'"
+    ROLE_READY=true
   else
-    log "Creating Postgres role '${POSTGRES_USER}'"
-    as_postgres psql -v ON_ERROR_STOP=1 -c \
-      "CREATE ROLE \"${POSTGRES_USER}\" WITH LOGIN PASSWORD '${POSTGRES_PASSWORD}';"
+    ROLE_READY=false
   fi
 
-  DB_EXISTS="$(as_postgres psql -tAc "SELECT 1 FROM pg_database WHERE datname='${POSTGRES_DB}'" 2>/dev/null | tr -d '[:space:]')"
-  if [ "$DB_EXISTS" = "1" ]; then
-    log "Database '${POSTGRES_DB}' already exists"
-  else
-    log "Creating database '${POSTGRES_DB}'"
-    as_postgres psql -v ON_ERROR_STOP=1 -c \
-      "CREATE DATABASE \"${POSTGRES_DB}\" OWNER \"${POSTGRES_USER}\";"
+  if $ROLE_READY; then
+    DB_EXISTS="$(as_postgres psql -tAc "SELECT 1 FROM pg_database WHERE datname='${POSTGRES_DB}'" 2>/dev/null | tr -d '[:space:]')" || true
+    if [ "$DB_EXISTS" = "1" ]; then
+      log "Database '${POSTGRES_DB}' already exists"
+      PG_READY=true
+    elif as_postgres psql -v ON_ERROR_STOP=1 -c "CREATE DATABASE \"${POSTGRES_DB}\" OWNER \"${POSTGRES_USER}\";"; then
+      log "Created database '${POSTGRES_DB}'"
+      PG_READY=true
+    fi
   fi
-else
-  warn "Can't manage PostgreSQL as the 'postgres' OS user on this machine (remote DB,"
-  warn "different auth setup, or no way to gain root). Make sure this database/role already"
-  warn "exist and match .env before continuing:"
-  info "  Database: ${POSTGRES_DB:-secret_bot}   Role: ${POSTGRES_USER:-secret_bot}"
-  ask_yes_no "Continue anyway?" y || exit 1
+fi
+
+if ! $PG_READY; then
+  warn "Couldn't finish setting up PostgreSQL automatically (no sudo/root available, or a"
+  warn "command above failed - see any error printed above this line)."
+  echo ""
+  info "Create them yourself before continuing. On a normal local PostgreSQL install:"
+  info "  sudo -u postgres psql"
+  info "then, at the psql prompt:"
+  info "  CREATE ROLE \"${POSTGRES_USER}\" WITH LOGIN PASSWORD '${POSTGRES_PASSWORD}';"
+  info "  CREATE DATABASE \"${POSTGRES_DB}\" OWNER \"${POSTGRES_USER}\";"
+  info "  \\q"
+  echo ""
+  info "(That's already the random password install.sh generated into .env - confirm any time"
+  info "with: grep POSTGRES_PASSWORD .env)"
+  info "If PostgreSQL is remote/managed or containerized, connect with your usual admin account"
+  info "instead (e.g. 'psql -h <host> -U <admin> -d postgres' or 'docker exec -it <name> psql -U postgres')"
+  info "and run the same two CREATE statements there."
+  echo ""
+  ask_yes_no "Continue once the role/database exist?" y || exit 1
 fi
 
 step "5. Running database migrations"

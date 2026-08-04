@@ -49,10 +49,10 @@ export function initHealthCheck(
 }
 
 async function checkHealth(): Promise<HealthCheckResult> {
-  const checks = {
-    postgres: 'ok' as const,
-    redis: 'ok' as const,
-    slack: 'pending' as const,
+  const checks: HealthCheckResult['checks'] = {
+    postgres: 'ok',
+    redis: 'ok',
+    slack: 'pending',
   }
 
   let status: 'healthy' | 'degraded' | 'unhealthy' = 'healthy'
