@@ -144,7 +144,7 @@ async function main() {
       ack: args.ack,
       body: args.body as any,
       client: args.client as any,
-      trigger_id: (args.action as any).trigger_id,
+      trigger_id: (args.body as any).trigger_id,
     })
   })
 
@@ -155,10 +155,12 @@ async function main() {
 
     if (!secretId) {
       logger.warn('Revoke confirm: no secretId in modal metadata')
+      await ack()
       return
     }
 
     logger.info({ secretId, userId }, 'Revoke confirm: modal submitted')
+    await ack()
     await handleRevokeConfirm({
       secretId,
       userId,

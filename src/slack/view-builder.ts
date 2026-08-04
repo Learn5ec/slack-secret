@@ -310,29 +310,6 @@ export function buildRevokeConfirmationModal(secretId: string) {
           text: '*Are you sure you want to revoke this secret?*\nIf it\'s gone, it\'s gone for good! This action cannot be undone.',
         },
       },
-      {
-        type: 'input',
-        block_id: 'revoke_confirm_block',
-        element: {
-          type: 'checkboxes',
-          options: [
-            {
-              text: {
-                type: 'plain_text',
-                text: 'Yes, revoke the secret',
-                emoji: true,
-              },
-              value: 'confirm',
-            },
-          ],
-          action_id: 'revoke_confirm_checkbox',
-        },
-        label: {
-          type: 'plain_text',
-          text: 'Please confirm',
-          emoji: true,
-        },
-      },
     ],
     private_metadata: secretId,
   }
