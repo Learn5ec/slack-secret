@@ -102,7 +102,7 @@ async function handleRecipientView(secret: any, viewerId: string, client: WebCli
     return
   }
 
-  const senderName = await getUserName(client, secret.sender_id)
+  const senderName = `<@${secret.sender_id}>`
   await handleViewFlow({
     secret,
     viewerId,
@@ -368,15 +368,13 @@ export async function handleViewedByAction(args: ActionArgs): Promise<void> {
     const views = await dbs.views.getViewsBySecretId(secretId)
 
     // Build viewer list
-    const viewerList = await Promise.all(
-      views.map(async (view: any) => {
-        const name = await getUserName(client, view.viewer_id)
-        const deliveredAt = view.delivered_at
-          ? formatIST(new Date(view.delivered_at))
-          : 'Unknown'
-        return { name, deliveredAt }
-      }),
-    )
+     const viewerList = views.map((view: any) => {
+      const name = `<@${view.viewer_id}>`
+      const deliveredAt = view.delivered_at
+        ? formatIST(new Date(view.delivered_at))
+        : 'Unknown'
+      return { name, deliveredAt }
+    })
 
     // If sender already has a Viewed By message open, remove it first so
     // repeated clicks don't pile up duplicates - and so Revoke always has at
@@ -592,14 +590,5 @@ export async function handleHideAction(args: ActionArgs): Promise<void> {
     logger.info({ secretId, userId, viewId: userView.id }, 'Secret hidden successfully')
   } catch (err: any) {
     logger.error({ err, secretId, userId }, 'Error in Hide action')
-  }
-}
-
-async function getUserName(client: WebClient, userId: string): Promise<string> {
-  try {
-    const result = await client.users.info({ user: userId })
-    return result.user?.name || userId
-  } catch {
-    return userId
   }
 }
