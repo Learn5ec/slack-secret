@@ -103,8 +103,8 @@ export async function handleModalSubmit(args: ModalSubmitArgs): Promise<void> {
     const allowedViewerId = recipientValue || null
 
     // Get sender name
-    const senderName = await getUserName(client, senderId)
-    const recipientName = recipientValue ? await getUserName(client, recipientValue) : null
+    const senderName = `<@${senderId}>`
+    const recipientName = recipientValue ? `<@${recipientValue}>` : null
 
     const secretType: 'text' | 'file' | 'combined' = hasText && hasFile ? 'combined' : hasFile ? 'file' : 'text'
     const masterKey = await getMasterKey()
@@ -264,15 +264,6 @@ export async function handleModalSubmit(args: ModalSubmitArgs): Promise<void> {
     }
   } catch (err: any) {
     logger.error({ err, errMessage: err.message, errStack: err.stack }, 'Error processing modal submission')
-  }
-}
-
-async function getUserName(client: WebClient, userId: string): Promise<string> {
-  try {
-    const result = await client.users.info({ user: userId })
-    return result.user?.name || userId
-  } catch {
-    return userId
   }
 }
 
