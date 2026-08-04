@@ -283,6 +283,61 @@ export function buildRevealedSecretBlocks(headerText: string, secretBlocks: any[
   ]
 }
 
+export function buildRevokeConfirmationModal(secretId: string) {
+  return {
+    type: 'modal',
+    callback_id: 'revoke_confirm',
+    title: {
+      type: 'plain_text',
+      text: 'Revoke Secret',
+      emoji: true,
+    },
+    submit: {
+      type: 'plain_text',
+      text: "I'm Sure",
+      emoji: true,
+    },
+    close: {
+      type: 'plain_text',
+      text: 'Cancel',
+      emoji: true,
+    },
+    blocks: [
+      {
+        type: 'section',
+        text: {
+          type: 'mrkdwn',
+          text: '*Are you sure you want to revoke this secret?*\nIf it\'s gone, it\'s gone for good! This action cannot be undone.',
+        },
+      },
+      {
+        type: 'input',
+        block_id: 'revoke_confirm_block',
+        element: {
+          type: 'checkboxes',
+          options: [
+            {
+              text: {
+                type: 'plain_text',
+                text: 'Yes, revoke the secret',
+                emoji: true,
+              },
+              value: 'confirm',
+            },
+          ],
+          action_id: 'revoke_confirm_checkbox',
+        },
+        label: {
+          type: 'plain_text',
+          text: 'Please confirm',
+          emoji: true,
+        },
+      },
+    ],
+    private_metadata: secretId,
+  }
+}
+
 export function buildPermanentAnnouncementBlocks(secretType: SecretType, senderName: string, recipientName?: string | null) {
   const { emoji, typeLabel } = describeSecretType(secretType)
 
