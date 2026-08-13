@@ -3,11 +3,12 @@ import { logger } from '../utils/logger'
 import { encryptSecret, encryptFile } from '../crypto/secret'
 import { getMasterKey } from '../crypto/master'
 import { getConfig } from '../config/timing'
-import { buildPlaceholderBlocks, buildRecipientPlaceholderBlocks, buildPermanentAnnouncementBlocks } from '../slack/view-builder'
+import { buildPlaceholderBlocks, buildRecipientPlaceholderBlocks, buildChannelAnnouncementBlocks } from '../slack/view-builder'
 import { createDatabases } from '../db'
 import { pool } from '../db/client'
 import { readLocalFile, writeLocalFile, getStorageDir, generateFilePath } from '../utils/file-ops'
 import { scanFile } from '../utils/av-scanner'
+import { channelDeliveryQueue } from '../queue/client'
 import axios from 'axios'
 import fs from 'fs'
 import path from 'path'
@@ -36,14 +37,11 @@ export async function handleModalSubmit(args: ModalSubmitArgs): Promise<void> {
 
   // Extract data from the modal state
   const values = view.state.values
-  logger.debug({ values }, 'Full modal state values')
-
+  // NOTE: Do NOT log modal values here — they contain the raw secret text and file URLs.
   const textValue = values.text_block?.secret_text?.value
   // Slack's file_input state value is an OBJECT ({ type: 'file_input', files: [...] }),
   // not an array itself - the uploaded files live under its `.files` property.
   const fileValue = values.file_block?.file_input?.files as any[] | undefined
-
-  logger.info({ fileValue, textValue, hasTextBlock: !!values.text_block, hasFileBlock: !!values.file_block }, 'Extracted file and text from modal')
 
   // Determine what we have
   const hasText = !!textValue && textValue.trim().length > 0
@@ -75,9 +73,44 @@ export async function handleModalSubmit(args: ModalSubmitArgs): Promise<void> {
   const secretText = hasText ? textValue : null
   const senderId = body.user.id
 
-  // Try to get recipient from modal state
-  const recipientFromState = (values.recipient_block?.recipient as any)?.selected_user
-  const recipientValue = recipientFromState || undefined
+  // Try to get recipient from modal state.
+  // conversations_select returns selected_conversation as a plain string ID:
+  // C... = public channel, G... = private channel/group, D... = DM, U... = user.
+  const selectedConv: string | null =
+    (values.recipient_block?.recipient as any)?.selected_conversation ?? null
+
+  if (!selectedConv) {
+    logger.warn('Modal submitted without recipient')
+    return
+  }
+
+  // Determine type by ID prefix
+  const isChannelRecipient =
+    selectedConv.startsWith('C') || selectedConv.startsWith('G')
+
+  let channelRecipientId: string | null = null
+  let dmUserId: string | null = null
+  let visibilityMode: 'single' | 'multi'
+
+  if (isChannelRecipient) {
+    visibilityMode = 'multi'
+    channelRecipientId = selectedConv
+  } else {
+    visibilityMode = 'single'
+    // selectedConv is a DM conversation ID (D...) or User ID (U...)
+    if (selectedConv.startsWith('U')) {
+      dmUserId = selectedConv
+    } else {
+      // D... DM conversation — resolve member
+      const convInfo = await client.conversations.info({ channel: selectedConv })
+      const members: string[] = (convInfo.channel as any)?.members || []
+      dmUserId = members.find((m: string) => m !== senderId) ?? null
+      if (!dmUserId) {
+        logger.error({ selectedConv }, 'Could not resolve DM recipient')
+        return
+      }
+    }
+  }
 
   // Try to get the origin channel ID from various sources
   let originChannelId = (body as any).channel?.id || (body as any).container?.channel_id
@@ -93,18 +126,20 @@ export async function handleModalSubmit(args: ModalSubmitArgs): Promise<void> {
     }
   }
 
-  logger.info({ senderId, recipient: recipientValue, hasText, hasFile, textLength: secretText?.length, originChannelId }, 'Processing modal submission')
+  logger.info({ senderId, recipient: dmUserId || channelRecipientId, hasText, hasFile, textLength: secretText?.length, originChannelId }, 'Processing modal submission')
 
   try {
     const dbs = createDatabases(pool)
 
-    // Determine visibility mode and recipient
-    const visibilityMode = recipientValue ? 'single' : 'multi'
-    const allowedViewerId = recipientValue || null
+    // Determine visibility mode and allowed viewer
+    // For channel secrets: visibility_mode='multi', allowedViewerId=null
+    // For 1:1: visibility_mode='single', allowedViewerId=dmUserId
+    const visibilityMode = isChannelRecipient ? 'multi' : 'single'
+    const allowedViewerId = isChannelRecipient ? null : dmUserId
 
     // Get sender name
     const senderName = `<@${senderId}>`
-    const recipientName = recipientValue ? `<@${recipientValue}>` : null
+    const recipientName = dmUserId ? `<@${dmUserId}>` : null
 
     const secretType: 'text' | 'file' | 'combined' = hasText && hasFile ? 'combined' : hasFile ? 'file' : 'text'
     const masterKey = await getMasterKey()
@@ -193,73 +228,116 @@ export async function handleModalSubmit(args: ModalSubmitArgs): Promise<void> {
 
     logger.info({ secretId: secret.id, secretType, hasText, hasFile }, 'Secret stored in DB')
 
-    // Build placeholder blocks
-    const placeholderBlocks = buildPlaceholderBlocks(secretType, senderName, recipientName, secret.id)
+    // For ALL secrets (1:1 and channel) — post sender's 3-button message to sender's DM
+    const senderDmResult = await client.conversations.open({ users: senderId })
+    const senderDmChannelId = senderDmResult.channel?.id
 
-    // Post PERMANENT announcement message
-    const announcementBlocks = buildPermanentAnnouncementBlocks(secretType, senderName, recipientName)
-    const announcementResult = await client.chat.postMessage({
-      channel: originChannelId,
-      blocks: announcementBlocks,
-      text: `${senderName} sent a ${secretType === 'text' ? 'secret' : secretType === 'file' ? 'file' : 'secret with file'}`,
-      metadata: {
-        event_type: 'secret_announcement',
-        event_payload: {
-          secret_id: secret.id,
-          sender_id: senderId,
-        },
-      },
-    })
-
-    if (announcementResult.ok) {
-      logger.info({ secretId: secret.id, announcementTs: announcementResult.ts }, 'Permanent announcement posted')
+    if (senderDmChannelId) {
+      const placeholderBlocks = buildPlaceholderBlocks(secretType, senderName, recipientName, secret.id)
+      const senderMsgResult = await client.chat.postMessage({
+        channel: senderDmChannelId,
+        blocks: placeholderBlocks,
+        text: `You shared a secret. Use the buttons to manage it.`,
+      })
+      if (senderMsgResult.ok && senderMsgResult.ts) {
+        await dbs.secrets.setSenderPlaceholderMessage(secret.id, senderDmChannelId, senderMsgResult.ts)
+        logger.info({ secretId: secret.id, senderDmChannelId }, 'Sender placeholder posted to DM')
+      }
     } else {
-      logger.error({ err: announcementResult.error }, 'Failed to post permanent announcement')
+      logger.warn({ secretId: secret.id, senderId }, 'Could not open DM with sender for placeholder')
     }
 
-    // Post the INTERACTIVE placeholder message
-    const postResult = await client.chat.postMessage({
-      channel: originChannelId,
-      blocks: placeholderBlocks,
-      text: `Secret shared by ${senderName}`,
-      metadata: {
-        event_type: 'secret_shared',
-        event_payload: {
-          secret_id: secret.id,
-          sender_id: senderId,
-        },
-      },
-    })
+    // Channel recipient: post announcement + async delivery
+    if (isChannelRecipient && channelRecipientId) {
+      // Resolve channel name for announcements
+      const channelInfo = await client.conversations.info({ channel: channelRecipientId })
+      const isMember = channelInfo.channel?.is_member
+      const isPrivate = channelInfo.channel?.is_private
+      const channelName = (channelInfo.channel as any)?.name ?? null
 
-    if (postResult.ok && postResult.ts) {
-      logger.info({ secretId: secret.id, placeholderTs: postResult.ts }, 'Interactive placeholder posted to origin channel')
-      await dbs.secrets.setSenderPlaceholderMessage(secret.id, originChannelId, postResult.ts)
-    } else {
-      logger.error({ err: postResult.error }, 'Failed to post interactive placeholder')
-    }
-
-    // If recipient specified, send a DM to the recipient
-    if (recipientValue) {
-      const dmResult = await client.conversations.open({ users: recipientValue })
-      const dmChannelId = dmResult.channel?.id
-
-      if (dmChannelId) {
-        const recipientPlaceholderBlocks = buildRecipientPlaceholderBlocks(secretType, senderName, recipientName, secret.id)
-
-        const dmPostResult = await client.chat.postMessage({
-          channel: dmChannelId,
-          blocks: recipientPlaceholderBlocks,
-          text: `Secret from ${senderName}`,
-        })
-
-        if (dmPostResult.ok) {
-          logger.info({ secretId: secret.id, dmChannelId }, 'Recipient DM posted')
-          await dbs.secrets.setRecipientDmMessage(secret.id, dmChannelId, dmPostResult.ts!)
+      if (!isMember) {
+        if (!isPrivate) {
+          // Public channel — bot can self-join
+          await client.conversations.join({ channel: channelRecipientId })
+          logger.info({ channelRecipientId }, 'Bot joined public channel')
         } else {
-          logger.error({ err: dmPostResult.error }, 'Failed to post recipient DM')
+          // Private channel — cannot auto-join, notify sender via their DM
+          logger.warn({ channelRecipientId }, 'Bot not in private channel, cannot deliver')
+          if (senderDmChannelId) {
+            await client.chat.postMessage({
+              channel: senderDmChannelId,
+              text: `⚠️ The bot is not in the private channel <#${channelRecipientId}>. Please invite @SecretBot to that channel first, then try again.`,
+            })
+          }
+          await dbs.secrets.hardDeleteSecretsForId(secret.id)
+          return
         }
-      } else {
-        logger.warn({ recipientId: recipientValue }, 'Failed to open DM channel')
+      }
+
+      // Post channel announcement (visible to all members)
+      const announcementBlocks = buildChannelAnnouncementBlocks(`<@${senderId}>`, channelName)
+      const announcementResult = await client.chat.postMessage({
+        channel: channelRecipientId,
+        blocks: announcementBlocks,
+        text: `<@${senderId}> shared a secret in #${channelName ?? 'this channel'}. Check your DMs.`,
+      })
+
+      if (announcementResult.ok && announcementResult.ts) {
+        await dbs.secrets.setChannelAnnouncementMessage(
+          secret.id,
+          channelRecipientId,
+          announcementResult.ts,
+        )
+      }
+
+      // Check member count against cap before enqueuing
+      const memberIds = await resolveChannelMembers(client, channelRecipientId)
+      const config = getConfig()
+      const botUid = await getBotUserId(client)
+      const memberCount = memberIds.filter((m: string) => m !== senderId && m !== botUid).length
+      if (memberCount > config.security.max_channel_members) {
+        logger.warn({ memberCount, cap: config.security.max_channel_members }, 'Channel too large')
+        if (senderDmChannelId) {
+          await client.chat.postMessage({
+            channel: senderDmChannelId,
+            text: `⚠️ Channel has ${memberCount} members, exceeding the cap of ${config.security.max_channel_members}. Secret not delivered.`,
+          })
+        }
+        await dbs.secrets.hardDeleteSecretsForId(secret.id)
+        return
+      }
+
+      // Enqueue async delivery — do NOT loop here (ack window constraint)
+      await channelDeliveryQueue.add('deliver-channel-secret', {
+        secretId: secret.id,
+        channelId: channelRecipientId,
+        senderId,
+      })
+
+      logger.info({ secretId: secret.id, channelRecipientId }, 'Channel secret delivery enqueued')
+    } else {
+      // 1:1 DM secret — recipient gets their View Secret DM (unchanged)
+      if (dmUserId) {
+        const dmResult = await client.conversations.open({ users: dmUserId })
+        const dmChannelId = dmResult.channel?.id
+        if (dmChannelId) {
+          const recipientPlaceholderBlocks = buildRecipientPlaceholderBlocks(secretType, senderName, recipientName, secret.id)
+
+          const dmPostResult = await client.chat.postMessage({
+            channel: dmChannelId,
+            blocks: recipientPlaceholderBlocks,
+            text: `Secret from ${senderName}`,
+          })
+
+          if (dmPostResult.ok) {
+            logger.info({ secretId: secret.id, dmChannelId }, 'Recipient DM posted')
+            await dbs.secrets.setRecipientDmMessage(secret.id, dmChannelId, dmPostResult.ts!)
+          } else {
+            logger.error({ err: dmPostResult.error }, 'Failed to post recipient DM')
+          }
+        } else {
+          logger.warn({ recipientId: dmUserId }, 'Failed to open DM channel')
+        }
       }
     }
   } catch (err: any) {
@@ -279,4 +357,36 @@ async function downloadFileFromSlack(client: WebClient, urlPrivate: string, urlP
   })
 
   return Buffer.from(response.data)
+}
+
+// Paginate conversations.members and return all member IDs (human + bot).
+// Used by the modal handler to compute the deliverable member count, and by
+// the channel-delivery worker to know who to DM.
+async function resolveChannelMembers(client: WebClient, channelId: string): Promise<string[]> {
+  const memberIds: string[] = []
+  let cursor: string | undefined
+  do {
+    const result = await (client as any).conversations.members({
+      channel: channelId,
+      limit: 1000,
+      cursor,
+    })
+    if (result.members) memberIds.push(...result.members)
+    cursor = result.response_metadata?.next_cursor
+  } while (cursor)
+  return memberIds
+}
+
+// Resolve the bot's own user ID so we can exclude it from channel deliveries.
+// Cached for the lifetime of the process.
+let cachedBotUserId: string | null = null
+export async function getBotUserId(client: WebClient): Promise<string | null> {
+  if (cachedBotUserId) return cachedBotUserId
+  try {
+    const authResult = await client.auth.test()
+    if (authResult.ok) cachedBotUserId = authResult.user_id as string
+  } catch (err) {
+    logger.error({ err }, 'Failed to resolve bot user ID')
+  }
+  return cachedBotUserId
 }

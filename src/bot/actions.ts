@@ -457,16 +457,20 @@ export async function handleCancelAction(args: ActionArgs): Promise<void> {
       return
     }
 
-    // Open a confirmation modal instead of immediately revoking
-    await client.views.open({
-      trigger_id: args.trigger_id!,
-      view: buildRevokeConfirmationModal(secretId) as any,
-    })
-    // Don't ack() here - we're not responding to the interaction, we're
-    // opening a modal. Ack will happen when the user submits the modal.
-  } catch (err: any) {
-    logger.error({ err, secretId, userId }, 'Failed to open revoke confirmation modal')
+    // Always ack first to satisfy Slack's interaction response deadline
     await ack()
+
+    // Open a confirmation modal instead of immediately revoking
+    try {
+      await client.views.open({
+        trigger_id: args.trigger_id!,
+        view: buildRevokeConfirmationModal(secretId) as any,
+      })
+    } catch (err: any) {
+      logger.error({ err, secretId, userId }, 'Failed to open revoke confirmation modal')
+    }
+  } catch (err: any) {
+    logger.error({ err, secretId, userId }, 'Unexpected error in cancel action')
   }
 }
 
@@ -525,7 +529,7 @@ export async function handleRevokeConfirm(args: {
         // would make purgeSecret delete it instead of the real interactive
         // placeholder (secret.sender_placeholder_channel_id/ts). Delete it
         // separately once purging is done.
-        await purgeSecret(client, dbs, secret)
+        await purgeSecret(client, dbs, secret, 'revoked')
       } catch (err: any) {
         logger.error({ err, secretId }, 'Error during revocation')
       } finally {

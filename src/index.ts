@@ -3,9 +3,10 @@ import { loadConfig } from './config'
 import { logger } from './utils/logger'
 import { pool, closePool } from './db/client'
 import { createDatabases } from './db'
-import { startWorkers, closeWorkers, deleteDmMessageQueue } from './queue/client'
+import { startWorkers, closeWorkers, deleteDmMessageQueue, channelDeliveryQueue } from './queue/client'
 import { processDeleteDmMessage } from './queue/delete-job'
 import { processPurgeExpiredSecret } from './queue/expiry-job'
+import { processChannelDelivery } from './queue/channel-delivery-job'
 import { slackClient } from './slack/client'
 import { handleSecretCommand } from './bot/commands'
 import { handleModalSubmit } from './bot/modals'
@@ -27,7 +28,7 @@ async function sweepExpiredSecrets(dbs: ReturnType<typeof createDatabases>): Pro
     logger.info({ count: expired.length }, 'Expiry sweep: purging expired secrets')
     for (const secret of expired) {
       try {
-        await purgeSecret(slackClient, dbs, secret)
+        await purgeSecret(slackClient, dbs, secret, 'expired')
       } catch (err: any) {
         logger.error({ err, secretId: secret.id }, 'Expiry sweep: failed to purge secret')
       }
@@ -181,6 +182,16 @@ async function main() {
   const dbs = createDatabases(pool)
   const { secrets: secretsRepo, views: viewsRepo } = dbs
 
+  // Resolve bot user ID once at startup so channel deliveries can exclude it
+  let botUserId: string | null = null
+  try {
+    const authResult = await (slackClient as any).auth.test()
+    if (authResult.ok) botUserId = authResult.user_id as string
+    logger.info({ botUserId }, 'Bot user ID resolved')
+  } catch (err) {
+    logger.error({ err }, 'Failed to resolve bot user ID — bot will not be excluded from channel deliveries')
+  }
+
   // Start config polling (re-reads config file every 60 seconds)
   startConfigPolling(60000)
 
@@ -191,6 +202,9 @@ async function main() {
     },
     async (job) => {
       await processPurgeExpiredSecret(job, slackClient, secretsRepo)
+    },
+    async (job) => {
+      await processChannelDelivery(job, slackClient, dbs, botUserId)
     },
   )
 

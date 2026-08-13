@@ -31,6 +31,9 @@ export type SecretRow = {
   viewed_by_ts: string | null
   sender_placeholder_channel_id: string | null
   sender_placeholder_ts: string | null
+  channel_recipient_id: string | null
+  channel_announcement_channel_id: string | null
+  channel_announcement_ts: string | null
 }
 
 export function createClient(pool: Pool) {
@@ -50,14 +53,15 @@ export function createClient(pool: Pool) {
     fileEncryptedDataKey?: Buffer | null
     allowedViewerId?: string | null
     visibilityMode?: 'single' | 'multi'
+    channelRecipientId?: string | null
     expiresAt: Date
   }): Promise<SecretRow> => {
     const result = await pool.query(
       `INSERT INTO secrets
         (sender_id, origin_channel_id, origin_ts, type, ciphertext, iv, encrypted_data_key,
          file_path, file_name, file_size_bytes, file_iv, file_encrypted_data_key,
-         allowed_viewer_id, visibility_mode, expires_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+         allowed_viewer_id, visibility_mode, channel_recipient_id, expires_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
        RETURNING *`,
       [
         params.senderId,
@@ -74,6 +78,7 @@ export function createClient(pool: Pool) {
         params.fileEncryptedDataKey ?? null,
         params.allowedViewerId ?? null,
         params.visibilityMode ?? 'single',
+        params.channelRecipientId ?? null,
         params.expiresAt,
       ],
     )
@@ -120,6 +125,13 @@ export function createClient(pool: Pool) {
   setSenderPlaceholderMessage: async (secretId: string, channelId: string, ts: string): Promise<void> => {
     await pool.query(
       'UPDATE secrets SET sender_placeholder_channel_id = $1, sender_placeholder_ts = $2 WHERE id = $3',
+      [channelId, ts, secretId],
+    )
+  },
+
+  setChannelAnnouncementMessage: async (secretId: string, channelId: string, ts: string): Promise<void> => {
+    await pool.query(
+      'UPDATE secrets SET channel_announcement_channel_id = $1, channel_announcement_ts = $2 WHERE id = $3',
       [channelId, ts, secretId],
     )
   },

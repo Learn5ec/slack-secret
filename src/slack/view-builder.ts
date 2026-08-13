@@ -22,13 +22,17 @@ export function buildSecretModal() {
         type: 'input',
         block_id: 'recipient_block',
         element: {
-          type: 'users_select',
+          type: 'conversations_select',
           placeholder: {
             type: 'plain_text',
-            text: 'Select a recipient',
+            text: 'Select a person or channel',
             emoji: true,
           },
           action_id: 'recipient',
+          filter: {
+            include: ['im', 'public', 'private'],
+            exclude_bot_users: true,
+          },
         },
         label: {
           type: 'plain_text',
@@ -313,6 +317,46 @@ export function buildRevokeConfirmationModal(secretId: string) {
     ],
     private_metadata: secretId,
   }
+}
+
+export function buildChannelAnnouncementBlocks(senderName: string, channelName?: string | null) {
+  const channelText = channelName ? `in *#${channelName}*` : 'to this channel'
+  return [
+    {
+      type: 'section',
+      text: {
+        type: 'mrkdwn',
+        text: `*${senderName} shared a secret ${channelText}.*\n_Check your DM from Secret Bot and view the secret safely._`,
+      },
+    },
+  ]
+}
+
+export function buildRevokedChannelAnnouncementBlocks(senderName: string, channelName?: string | null) {
+  const channelText = channelName ? `in *#${channelName}*` : 'to this channel'
+  return [
+    {
+      type: 'section',
+      text: {
+        type: 'mrkdwn',
+        text: `_~~🔒 ${senderName} shared a secret ${channelText}.~~_\n*This secret was revoked.*`,
+      },
+    },
+  ]
+}
+
+export function buildExpiredChannelAnnouncementBlocks(senderName: string, channelName?: string | null, expiredAt?: string) {
+  const channelText = channelName ? `in *#${channelName}*` : 'to this channel'
+  const expiredText = expiredAt ? ` at ${expiredAt} IST` : ''
+  return [
+    {
+      type: 'section',
+      text: {
+        type: 'mrkdwn',
+        text: `_~~🔒 ${senderName} shared a secret ${channelText}.~~_\n*This secret expired${expiredText}.*`,
+      },
+    },
+  ]
 }
 
 export function buildPermanentAnnouncementBlocks(secretType: SecretType, senderName: string, recipientName?: string | null) {
