@@ -14,6 +14,7 @@ export type SecurityConfig = {
   max_recipients: number
   allow_multi_viewer: boolean
   max_file_size_bytes: number
+  max_channel_members: number
 }
 
 export type BehaviorConfig = {
@@ -56,6 +57,7 @@ function loadConfigFromFile(): SecretBotConfig {
         max_recipients: rawConfig.security.max_recipients || 1,
         allow_multi_viewer: rawConfig.security.allow_multi_viewer !== false,
         max_file_size_bytes: rawConfig.security.max_file_size_bytes || 10 * 1024 * 1024,
+        max_channel_members: rawConfig.security.max_channel_members || 100,
       },
       behavior: {
         sender_sees_buttons: rawConfig.behavior.sender_sees_buttons !== false,
@@ -85,6 +87,7 @@ function getDefaultConfig(): SecretBotConfig {
       max_recipients: 1,
       allow_multi_viewer: true,
       max_file_size_bytes: 10 * 1024 * 1024,
+      max_channel_members: 100,
     },
     behavior: {
       sender_sees_buttons: true,

@@ -3,6 +3,7 @@ import fs from 'fs'
 import { logger } from '../utils/logger'
 import { deleteSlackMessage, deleteSlackFile } from '../slack/messages'
 import { deleteDmMessageQueue } from '../queue/client'
+import { buildRevokedChannelAnnouncementBlocks, buildExpiredChannelAnnouncementBlocks } from '../slack/view-builder'
 
 // Full teardown of a secret: every revealed message/file for every viewer,
 // the recipient placeholder, the Viewed By message, the sender's own
@@ -14,6 +15,7 @@ export async function purgeSecret(
   client: WebClient,
   dbs: any,
   secret: any,
+  reason: 'revoked' | 'expired' = 'expired',
   placeholder?: { channelId: string; ts: string },
 ): Promise<void> {
   const secretId = secret.id
@@ -80,6 +82,37 @@ export async function purgeSecret(
     logger.info({ secretId, channelId: placeholderChannelId, ts: placeholderTs }, 'Deleted interactive placeholder message')
   } else {
     logger.warn({ secretId }, 'No sender placeholder reference available - cannot delete it')
+  }
+
+  // Update channel announcement in-place (if any)
+  if (secret.channel_announcement_channel_id && secret.channel_announcement_ts) {
+    try {
+      const channelInfo = await client.conversations.info({
+        channel: secret.channel_announcement_channel_id,
+      })
+      const channelName = (channelInfo.channel as any)?.name ?? null
+      const senderName = `<@${secret.sender_id}>`
+
+      const blocks = reason === 'revoked'
+        ? buildRevokedChannelAnnouncementBlocks(senderName, channelName)
+        : buildExpiredChannelAnnouncementBlocks(
+            senderName,
+            channelName,
+            new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' }),
+          )
+
+      await client.chat.update({
+        channel: secret.channel_announcement_channel_id,
+        ts: secret.channel_announcement_ts,
+        blocks,
+        text: reason === 'revoked'
+          ? `${senderName} revoked a secret.`
+          : `${senderName}'s secret expired.`,
+      })
+      logger.info({ secretId, channelId: secret.channel_announcement_channel_id, ts: secret.channel_announcement_ts }, 'Channel announcement updated in-place')
+    } catch (err: any) {
+      logger.error({ err, secretId }, 'Failed to update channel announcement')
+    }
   }
 
   // For secrets carrying a file, delete the local encrypted file

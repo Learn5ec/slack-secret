@@ -14,6 +14,12 @@ export interface PurgeExpiredSecretPayload {
   isConsumed: boolean
 }
 
+export interface ChannelDeliveryPayload {
+  secretId: string
+  channelId: string
+  senderId: string
+}
+
 export const deleteDmMessageQueue = new Queue<DeleteDmMessagePayload>('delete-dm-message', {
   connection: { url: config.REDIS_URL },
   defaultJobOptions: {
@@ -30,13 +36,25 @@ export const purgeExpiredSecretQueue = new Queue<PurgeExpiredSecretPayload>('pur
   },
 })
 
+export const channelDeliveryQueue = new Queue<ChannelDeliveryPayload>('channel-delivery', {
+  connection: { url: config.REDIS_URL },
+  defaultJobOptions: {
+    attempts: 3,
+    backoff: { type: 'exponential', delay: 5000 },
+    removeOnComplete: 50,
+    removeOnFail: 20,
+  },
+})
+
 let deleteWorker: Worker<DeleteDmMessagePayload> | null = null
 let purgeWorker: Worker<PurgeExpiredSecretPayload> | null = null
+let channelDeliveryWorker: Worker<ChannelDeliveryPayload> | null = null
 
 export function startWorkers(
   deleteProcessor: (job: { data: DeleteDmMessagePayload }) => Promise<void>,
   purgeProcessor: (job: { data: PurgeExpiredSecretPayload }) => Promise<void>,
-): { deleteWorker: Worker<DeleteDmMessagePayload>; purgeWorker: Worker<PurgeExpiredSecretPayload> } {
+  channelDeliveryProcessor?: (job: { data: ChannelDeliveryPayload }) => Promise<void>,
+): { deleteWorker: Worker<DeleteDmMessagePayload>; purgeWorker: Worker<PurgeExpiredSecretPayload>; channelDeliveryWorker: Worker<ChannelDeliveryPayload> | null } {
   deleteWorker = new Worker<DeleteDmMessagePayload>(
     'delete-dm-message',
     async (job) => {
@@ -55,10 +73,22 @@ export function startWorkers(
     { connection: { url: config.REDIS_URL } },
   )
 
+  if (channelDeliveryProcessor) {
+    channelDeliveryWorker = new Worker<ChannelDeliveryPayload>(
+      'channel-delivery',
+      async (job) => {
+        logger.info({ jobId: job.id, data: job.data }, 'Processing channel-delivery job')
+        await channelDeliveryProcessor(job)
+      },
+      { connection: { url: config.REDIS_URL }, concurrency: 1 },
+    )
+    channelDeliveryWorker.on('error', (err) => logger.error({ err }, 'Channel delivery worker error'))
+  }
+
   deleteWorker.on('error', (err) => logger.error({ err }, 'Delete worker error'))
   purgeWorker.on('error', (err) => logger.error({ err }, 'Purge worker error'))
 
-  return { deleteWorker, purgeWorker }
+  return { deleteWorker, purgeWorker, channelDeliveryWorker }
 }
 
 export async function closeWorkers(): Promise<void> {
@@ -67,5 +97,8 @@ export async function closeWorkers(): Promise<void> {
   }
   if (purgeWorker) {
     await purgeWorker.close()
+  }
+  if (channelDeliveryWorker) {
+    await channelDeliveryWorker.close()
   }
 }
