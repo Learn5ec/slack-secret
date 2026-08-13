@@ -42,8 +42,6 @@ export async function processChannelDelivery(
   }
 
   const memberIds = await resolveChannelMembers(client, channelId)
-  const config = getConfig()
-  const deleteAt = new Date(Date.now() + config.timing.secret_expiry_ms)
 
   let delivered = 0
   for (const memberId of memberIds) {
@@ -64,12 +62,14 @@ export async function processChannelDelivery(
       })
 
       if (postResult.ok && postResult.ts) {
-        await dbs.views.createDeliveredView({
+        // Record this DM placeholder in the channel_member_dms table (NOT views)
+        // so that revoke/expiry can delete the un-opened placeholder independently
+        // of the per-user revealed-secret views.
+        await dbs.channelMemberDms.create({
           secretId,
-          viewerId: memberId,
+          memberId,
           dmChannelId,
           dmTs: postResult.ts,
-          deleteAt,
         })
         delivered++
       }
