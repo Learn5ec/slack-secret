@@ -84,6 +84,15 @@ export async function purgeSecret(
     logger.warn({ secretId }, 'No sender placeholder reference available - cannot delete it')
   }
 
+  // Delete channel member DM placeholders (View Secret buttons sent before anyone clicked)
+  const channelDms = await dbs.channelMemberDms.getBySecretId(secretId)
+  for (const channelDm of channelDms) {
+    if (channelDm.dm_ts) {
+      await deleteSlackMessage(client, channelDm.dm_channel_id, channelDm.dm_ts)
+    }
+  }
+  logger.info({ secretId, channelDmCount: channelDms.length }, 'Deleted channel member DM placeholders')
+
   // Update channel announcement in-place (if any)
   if (secret.channel_announcement_channel_id && secret.channel_announcement_ts) {
     try {
