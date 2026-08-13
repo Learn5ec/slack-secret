@@ -339,7 +339,7 @@ export function buildRevokedChannelAnnouncementBlocks(senderName: string, channe
       type: 'section',
       text: {
         type: 'mrkdwn',
-        text: `_~~🔒 ${senderName} shared a secret ${channelText}.~~_\n*This secret was revoked.*`,
+        text: `_🔒 ${senderName} shared a secret ${channelText}._\n*This secret was revoked.*`,
       },
     },
   ]
@@ -353,7 +353,7 @@ export function buildExpiredChannelAnnouncementBlocks(senderName: string, channe
       type: 'section',
       text: {
         type: 'mrkdwn',
-        text: `_~~🔒 ${senderName} shared a secret ${channelText}.~~_\n*This secret expired${expiredText}.*`,
+        text: `_🔒 ${senderName} shared a secret ${channelText}._\n*This secret expired${expiredText}.*`,
       },
     },
   ]
