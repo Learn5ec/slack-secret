@@ -8,7 +8,7 @@ import { getConfig } from '../config/timing'
 
 export interface ChannelDeliveryPayload {
   secretId: string
-  recipientKind?: 'channel' | 'usergroup'
+  recipientKind?: 'channel' | 'usergroup' | 'mpim'
   recipientId?: string
   // Legacy alias for recipientId (channel), kept so any in-flight job still runs.
   channelId?: string
@@ -63,7 +63,7 @@ export async function processChannelDelivery(
       : await resolveChannelMembers(client, recipientId)
 
   const deliverable = memberIds.filter((m) => m !== senderId && m !== botUserId)
-  const noun = kind === 'usergroup' ? 'user group' : 'channel'
+  const noun = kind === 'usergroup' ? 'user group' : kind === 'mpim' ? 'group conversation' : 'channel'
 
   // Helper to DM the sender about delivery problems.
   async function notifySender(text: string): Promise<void> {

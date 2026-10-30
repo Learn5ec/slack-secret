@@ -99,15 +99,20 @@ export async function purgeSecret(
       const channelInfo = await client.conversations.info({
         channel: secret.channel_announcement_channel_id,
       })
-      const channelName = (channelInfo.channel as any)?.name ?? null
+      // An mpim's real name is an "mpdm-…" slug; show "this group conversation"
+      // instead of "#mpdm-…". Only channels with a real name get "#name".
+      const isMpim = (channelInfo.channel as any)?.is_mpim === true
+      const channelName = isMpim ? null : ((channelInfo.channel as any)?.name ?? null)
+      const label = isMpim ? 'group conversation' : 'channel'
       const senderName = `<@${secret.sender_id}>`
 
       const blocks = reason === 'revoked'
-        ? buildRevokedChannelAnnouncementBlocks(senderName, channelName)
+        ? buildRevokedChannelAnnouncementBlocks(senderName, channelName, label)
         : buildExpiredChannelAnnouncementBlocks(
             senderName,
             channelName,
             new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' }),
+            label,
           )
 
       await client.chat.update({

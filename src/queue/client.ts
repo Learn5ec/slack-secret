@@ -17,8 +17,9 @@ export interface PurgeExpiredSecretPayload {
 export interface ChannelDeliveryPayload {
   secretId: string
   // 'channel' posts an announcement elsewhere + fans out to channel members;
-  // 'usergroup' expands a Slack User Group and DMs each member.
-  recipientKind?: 'channel' | 'usergroup'
+  // 'usergroup' expands a Slack User Group and DMs each member;
+  // 'mpim' resolves a group conversation's members and DMs each one.
+  recipientKind?: 'channel' | 'usergroup' | 'mpim'
   recipientId?: string
   // Legacy alias for recipientId (channel), kept so any in-flight job still runs.
   channelId?: string

@@ -93,26 +93,59 @@ export async function handleModalSubmit(args: ModalSubmitArgs): Promise<void> {
   const selectedUserGroupId: string | null =
     (values.usergroup_block?.usergroup as any)?.selected_option?.value ?? null
 
-  if (selectedUserGroupId && selectedConv) {
-    logger.warn({ selectedUserGroupId, selectedConv }, 'Both recipient and user group selected')
-    await notifySender('⚠️ Please choose either a recipient (person/channel) OR a user group, not both.')
+  // Optional Group Conversation (mpim) ID field (plain_text_input). Accepts a
+  // raw channel id or a pasted Slack conversation link.
+  const mpimInput = ((values.mpim_block?.mpim_id as any)?.value ?? '').trim()
+  const selectedMpimId: string | null = mpimInput ? extractChannelId(mpimInput) : null
+
+  // Exactly one of the three recipient modes may be set.
+  const modesSet = [selectedConv, selectedUserGroupId, selectedMpimId].filter(Boolean)
+  if (modesSet.length > 1) {
+    logger.warn({ selectedConv, selectedUserGroupId, selectedMpimId }, 'Multiple recipient modes selected')
+    await notifySender(
+      '⚠️ Please choose only one recipient type: a recipient (person/channel), a user group, OR a group conversation ID.',
+    )
     return
   }
-  if (!selectedUserGroupId && !selectedConv) {
-    logger.warn('Modal submitted without recipient or user group')
-    await notifySender('⚠️ Please select a recipient or a user group before sending.')
+  if (modesSet.length === 0) {
+    logger.warn('Modal submitted without any recipient')
+    await notifySender('⚠️ Please select a recipient, a user group, or a group conversation ID before sending.')
     return
   }
 
   const isUserGroupRecipient = !!selectedUserGroupId
-  // Determine channel vs 1:1 only when not targeting a user group.
+  const isMpimRecipient = !!selectedMpimId
+  // Determine channel vs 1:1 only when not targeting a user group or group conversation.
   const isChannelRecipient =
-    !isUserGroupRecipient && (selectedConv!.startsWith('C') || selectedConv!.startsWith('G'))
+    !isUserGroupRecipient && !isMpimRecipient && (selectedConv!.startsWith('C') || selectedConv!.startsWith('G'))
+
+  // Validate the group conversation EARLY, before any secret is created. The
+  // bot must be a member to enumerate members (conversations.members/info
+  // return channel_not_found otherwise), and it must actually be an mpim — a
+  // pasted id can be any conversation, so we don't trust the prefix (an mpim
+  // can carry a C prefix and is_private=true; only is_mpim is reliable).
+  if (isMpimRecipient) {
+    try {
+      const info = await client.conversations.info({ channel: selectedMpimId! })
+      if (!info.ok || !(info.channel as any)?.is_mpim) {
+        await notifySender(
+          '⚠️ That is not a group conversation (multi-person DM). Please share to a person, a channel, or a user group instead.',
+        )
+        return
+      }
+    } catch (err: any) {
+      logger.warn({ err, selectedMpimId }, 'Could not access group conversation; likely bot is not a member')
+      await notifySender(
+        '⚠️ The bot could not access that group conversation. Please add @SecretBot to it first, then try again.',
+      )
+      return
+    }
+  }
 
   let channelRecipientId: string | null = null
   let dmUserId: string | null = null
 
-  if (isUserGroupRecipient) {
+  if (isUserGroupRecipient || isMpimRecipient) {
     // Delivery is handled by the fan-out worker; no per-recipient id resolved here.
   } else if (isChannelRecipient) {
     channelRecipientId = selectedConv
@@ -153,12 +186,12 @@ export async function handleModalSubmit(args: ModalSubmitArgs): Promise<void> {
     const dbs = createDatabases(pool)
 
     // Determine visibility mode and allowed viewer.
-    // - User group: 'multi', allowedViewerId=null (fan-out to members)
-    // - Channel:    'multi', allowedViewerId=null
-    // - 1:1:        'single', allowedViewerId=dmUserId
-    const visibilityMode: 'single' | 'multi' =
-      isUserGroupRecipient || isChannelRecipient ? 'multi' : 'single'
-    const allowedViewerId = isUserGroupRecipient || isChannelRecipient ? null : dmUserId
+    // - User group / group conversation (mpim): 'multi', allowedViewerId=null (fan-out to members)
+    // - Channel: 'multi', allowedViewerId=null
+    // - 1:1:     'single', allowedViewerId=dmUserId
+    const multiFanOut = isUserGroupRecipient || isChannelRecipient || isMpimRecipient
+    const visibilityMode: 'single' | 'multi' = multiFanOut ? 'multi' : 'single'
+    const allowedViewerId = multiFanOut ? null : dmUserId
 
     // Get sender name + a display label for the recipient (used on the
     // sender's own placeholder). For a user group we show the group handle as
@@ -321,6 +354,46 @@ export async function handleModalSubmit(args: ModalSubmitArgs): Promise<void> {
         { secretId: secret.id, selectedUserGroupId, groupMemberCount },
         'User group secret delivery enqueued',
       )
+    } else if (isMpimRecipient && selectedMpimId) {
+      // Group conversation (mpim): fan out a per-member DM, plus an
+      // announcement in the conversation (the bot is a member to be here at
+      // all). The sender is a member too and is excluded from fan-out, so they
+      // only ever see their own control message.
+      const botUid = await getBotUserId(client)
+      const mpimMemberIds = await resolveChannelMembers(client, selectedMpimId)
+      const memberCount = mpimMemberIds.filter((m) => m !== senderId && m !== botUid).length
+
+      const config = getConfig()
+      if (memberCount > config.security.max_channel_members) {
+        logger.warn({ memberCount, cap: config.security.max_channel_members }, 'Group conversation too large')
+        await notifySender(
+          `⚠️ That group conversation has ${memberCount} members, exceeding the cap of ${config.security.max_channel_members}. Secret not delivered.`,
+        )
+        await dbs.secrets.hardDeleteSecretsForId(secret.id)
+        return
+      }
+
+      // Announcement into the group conversation. Reuse the channel-announcement
+      // tracking so revoke/expiry updates it in place. Pass channelName=null +
+      // label 'group conversation' (an mpim's real name is an "mpdm-…" slug).
+      const announcementBlocks = buildChannelAnnouncementBlocks(`<@${senderId}>`, null, 'group conversation')
+      const announcementResult = await client.chat.postMessage({
+        channel: selectedMpimId,
+        blocks: announcementBlocks,
+        text: `<@${senderId}> shared a secret in this group conversation. Check your DMs.`,
+      })
+      if (announcementResult.ok && announcementResult.ts) {
+        await dbs.secrets.setChannelAnnouncementMessage(secret.id, selectedMpimId, announcementResult.ts)
+      }
+
+      await channelDeliveryQueue.add('deliver-mpim-secret', {
+        secretId: secret.id,
+        recipientKind: 'mpim',
+        recipientId: selectedMpimId,
+        senderId,
+      })
+
+      logger.info({ secretId: secret.id, selectedMpimId, memberCount }, 'Group conversation secret delivery enqueued')
     } else if (isChannelRecipient && channelRecipientId) {
       // Resolve channel name for announcements
       const channelInfo = await client.conversations.info({ channel: channelRecipientId })
@@ -418,8 +491,17 @@ export async function handleModalSubmit(args: ModalSubmitArgs): Promise<void> {
   }
 }
 
-async function downloadFileFromSlack(client: WebClient, urlPrivate: string, urlPrivateDownload: string): Promise<Buffer> {
-  // Use the bot token to download the file
+// Accept a raw Slack conversation id (e.g. "C0CEBDXC2GY") or a pasted Slack
+// conversation link (e.g. https://x.slack.com/app_redirect?channel=C0CEBDXC2GY)
+// and return just the id. Falls back to the trimmed input if no id-shaped token
+// is found (so a malformed value still flows into the conversations.info check,
+// which fails it cleanly).
+function extractChannelId(input: string): string {
+  const matches = input.toUpperCase().match(/[A-Z0-9]{8,}/g)
+  return matches && matches.length > 0 ? matches[matches.length - 1] : input.trim()
+}
+
+async function downloadFileFromSlack(client: WebClient, urlPrivate: string, urlPrivateDownload: string): Promise<Buffer> {  // Use the bot token to download the file
   const token = (client as any).token
 
   const response = await axios.get(urlPrivateDownload, {

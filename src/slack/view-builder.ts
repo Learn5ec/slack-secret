@@ -86,6 +86,29 @@ export function buildSecretModal(userGroups: UserGroupOption[] = []) {
       },
       {
         type: 'input',
+        block_id: 'mpim_block',
+        element: {
+          type: 'plain_text_input',
+          action_id: 'mpim_id',
+          placeholder: {
+            type: 'plain_text',
+            text: 'e.g. C0CEBDXC2GY or a Slack conversation link',
+            emoji: true,
+          },
+        },
+        label: {
+          type: 'plain_text',
+          text: 'Group Conversation ID (optional)',
+          emoji: true,
+        },
+        // The bot must be a member of the group conversation to enumerate its
+        // members. If it isn't, the modal handler DMs the sender to add
+        // @SecretBot first. Exactly one of Recipient / User Group / this field
+        // may be set.
+        optional: true,
+      },
+      {
+        type: 'input',
         block_id: 'text_block',
         element: {
           type: 'plain_text_input',
@@ -363,8 +386,15 @@ export function buildRevokeConfirmationModal(secretId: string) {
   }
 }
 
-export function buildChannelAnnouncementBlocks(senderName: string, channelName?: string | null) {
-  const channelText = channelName ? `in *#${channelName}*` : 'to this channel'
+// `label` is the conversation noun used when there's no channel name to show
+// (an mpim's real name is an "mpdm-…" slug, so we say "this group conversation"
+// instead of "#mpdm-…"). Defaults to 'channel' so existing calls are unchanged.
+function announcementLabel(channelName?: string | null, label = 'channel'): string {
+  return channelName ? `in *#${channelName}*` : `to this ${label}`
+}
+
+export function buildChannelAnnouncementBlocks(senderName: string, channelName?: string | null, label = 'channel') {
+  const channelText = announcementLabel(channelName, label)
   return [
     {
       type: 'section',
@@ -376,8 +406,8 @@ export function buildChannelAnnouncementBlocks(senderName: string, channelName?:
   ]
 }
 
-export function buildRevokedChannelAnnouncementBlocks(senderName: string, channelName?: string | null) {
-  const channelText = channelName ? `in *#${channelName}*` : 'to this channel'
+export function buildRevokedChannelAnnouncementBlocks(senderName: string, channelName?: string | null, label = 'channel') {
+  const channelText = announcementLabel(channelName, label)
   return [
     {
       type: 'section',
@@ -389,8 +419,8 @@ export function buildRevokedChannelAnnouncementBlocks(senderName: string, channe
   ]
 }
 
-export function buildExpiredChannelAnnouncementBlocks(senderName: string, channelName?: string | null, expiredAt?: string) {
-  const channelText = channelName ? `in *#${channelName}*` : 'to this channel'
+export function buildExpiredChannelAnnouncementBlocks(senderName: string, channelName?: string | null, expiredAt?: string, label = 'channel') {
+  const channelText = announcementLabel(channelName, label)
   const expiredText = expiredAt ? ` at ${expiredAt} IST` : ''
   return [
     {
