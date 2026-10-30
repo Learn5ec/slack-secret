@@ -2,6 +2,27 @@
 
 A Slack bot that lets users share text, files, or both privately with per-viewer view-once, instant-hide, and auto-delete behavior.
 
+## 📌 Which branch should I use?
+
+Secret Bot ships in three cumulative tiers, one per branch — each includes everything in the tier
+below it, plus the same encryption / view-once / auto-delete / revoke behavior described below. **You
+are on the channel-sharing tier.**
+
+| Branch | Can share to | Use it when… |
+| --- | --- | --- |
+| `main` | One person (1:1 DM) | You only need peer-to-peer secret sharing. |
+| **`feat-multi-secret`** ← *you are here* | + Slack channels (public & private, DMs each member) | You also need channel-wide sharing. |
+| `feat-share-and-group-support` | + User Groups, Group Conversations (private group DMs), forwarding an already-shared secret, and per-recipient access management | You want every recipient type and the most control. |
+
+To clone a specific tier:
+
+```bash
+git clone --branch <branch> https://github.com/Learn5ec/slack-secret.git
+```
+
+> **Bot membership:** sharing to a channel requires `@SecretBot` to be a member of it. The bot never
+> auto-joins private channels — if it's missing, it DMs the sender to add it first.
+
 ## 🚀 Features
 
 ### Core Functionality
@@ -12,6 +33,7 @@ A Slack bot that lets users share text, files, or both privately with per-viewer
 - **Combined Secrets**: Text and a file together in one share
 - **Single Viewer Mode**: Send secrets to one specific user via DM
 - **Multi Viewer Mode**: Share with anyone who clicks (no recipient specified)
+- **Channel Sharing**: Pick a public or private channel; the bot DMs each member a one-time "View Secret" and posts a single "shared a secret in #channel — check your DMs" announcement. Bounded by `max_channel_members` (default 100). The bot must be a channel member — public channels are auto-joined, private channels require the sender to invite `@SecretBot` first. (User Groups, group conversations, forwarding, and per-recipient access control live on the higher `feat-share-and-group-support` branch.)
 
 ### Encryption & Security
 
@@ -80,7 +102,8 @@ Dynamic config file at `config/secret-bot-config.json`, hot-reloaded (checked ev
     "max_secret_length": 3000,
     "max_recipients": 1,
     "allow_multi_viewer": true,
-    "max_file_size_bytes": 10485760
+    "max_file_size_bytes": 13631488,
+    "max_channel_members": 100
   },
   "behavior": {
     "sender_sees_buttons": true,
@@ -97,7 +120,7 @@ Dynamic config file at `config/secret-bot-config.json`, hot-reloaded (checked ev
 
 ### Database Schema
 
-**secrets table** (`src/db/migrations/001`–`008`):
+**secrets table** (`src/db/migrations/001`–`010`):
 - `id` (UUID), `sender_id`, `origin_channel_id`, `origin_ts`
 - `type` (`text` / `file` / `combined`)
 - text envelope: `ciphertext`, `iv`, `encrypted_data_key`
@@ -106,13 +129,18 @@ Dynamic config file at `config/secret-bot-config.json`, hot-reloaded (checked ev
 - `status` (`pending`/`expired`/`cancelled` — `consumed` is a legacy value nothing sets anymore)
 - `created_at`, `expires_at`
 - message tracking for cleanup: `recipient_dm_channel_id`/`recipient_dm_ts`, `viewed_by_channel_id`/`viewed_by_ts`, `sender_placeholder_channel_id`/`sender_placeholder_ts`
+- channel sharing: `channel_announcement_channel_id`/`channel_announcement_ts` (the single announcement the bot posts and later updates in place on revoke/expiry)
 
-**views table**:
+**views table** (`001`):
 - `id` (UUID), `secret_id` (FK), `viewer_id`
 - `dm_channel_id`, `dm_ts` (text reveal), `file_dm_ts` + `file_upload_id` (file reveal, tracked separately so either can be deleted on its own)
 - `delivered_at`, `delete_at` (fixed at first view, never extended by hide/re-open)
 - `status` (`delivered`/`deleted`)
 - `UNIQUE(secret_id, viewer_id)` — this is what makes view-once per-viewer instead of per-secret
+
+**channel_member_dms table** (`010`): one row per channel member (`UNIQUE(secret_id, member_id)`),
+tracking that member's un-opened "View Secret" placeholder DM (`dm_channel_id`, `dm_ts`) so Revoke /
+expiry can delete it independently of revealed copies.
 
 ### Deployment
 
@@ -153,7 +181,11 @@ You'll still need to create `.env` yourself (see `.env.example`) and have Postgr
 already running and reachable.
 
 **Required Slack bot token scopes**: `commands`, `chat:write`, `chat:write.public`, `im:write`,
-`files:write`, `channels:read`, `groups:read`, `files:read`, `users:read`. Socket Mode must be
+`files:write`, `channels:read`, `groups:read`, `files:read`, `users:read`. Channel sharing on this
+branch needs no extra scopes — it reuses the ones above to enumerate members and post the
+announcement. (User Groups and group conversations, on the higher
+`feat-share-and-group-support` branch, additionally need `usergroups:read`, `mpim:read`, `mpim:write`.)
+Socket Mode must be
 enabled (that's where `SLACK_APP_TOKEN` comes from).
 
 **Known limitation**: the *original* file a sender uploads through the modal's file picker is
@@ -188,6 +220,15 @@ per-user OAuth `files:write` consent flow, which isn't built.
 ## 📋 Changelog
 
 ### Unreleased
+
+**Channel sharing (this tier)**
+
+- ✅ Send a secret to a public/private channel — each member DM'd a one-time View Secret, with a
+  single in-channel announcement that is updated in place on revoke/expiry
+- ✅ `channel_member_dms` table (`010`) tracks each member's placeholder DM for independent cleanup;
+  `channel_announcement_*` fields on `secrets` (`009`)
+- ✅ `max_channel_members` cap (default 100); public channels auto-joined, private channels require the
+  sender to invite `@SecretBot` first
 
 **Removed unimplemented/abandoned feature remnants**
 
