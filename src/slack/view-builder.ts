@@ -6,8 +6,9 @@ function truncate(s: string, n: number): string {
   return s.length > n ? s.slice(0, n - 1) + '…' : s
 }
 
-export function buildSecretModal(userGroups: UserGroupOption[] = []) {
-  const groupOptions = userGroups.length === 0
+// Build the User Group static_select options (shared by the share and secret modals).
+function usergroupOptions(userGroups: UserGroupOption[]) {
+  return userGroups.length === 0
     ? [{ text: { type: 'plain_text' as const, text: 'No user groups available' }, value: '' }]
     : userGroups.slice(0, MAX_STATIC_OPTIONS).map((g) => ({
         text: {
@@ -19,6 +20,10 @@ export function buildSecretModal(userGroups: UserGroupOption[] = []) {
         },
         value: g.id,
       }))
+}
+
+export function buildSecretModal(userGroups: UserGroupOption[] = []) {
+  const groupOptions = usergroupOptions(userGroups)
 
   return {
     type: 'modal',
@@ -190,6 +195,26 @@ export function buildPlaceholderBlocks(secretType: SecretType, senderName: strin
             emoji: true,
           },
           action_id: 'secret:viewed-by',
+          value: secretId || '',
+        },
+        {
+          type: 'button',
+          text: {
+            type: 'plain_text',
+            text: '🔗 Share',
+            emoji: true,
+          },
+          action_id: 'secret:share',
+          value: secretId || '',
+        },
+        {
+          type: 'button',
+          text: {
+            type: 'plain_text',
+            text: '👥 Manage',
+            emoji: true,
+          },
+          action_id: 'secret:manage',
           value: secretId || '',
         },
         {
@@ -449,4 +474,99 @@ export function buildPermanentAnnouncementBlocks(secretType: SecretType, senderN
       },
     },
   ]
+}
+
+// Share/forward an EXISTING secret. Same three recipient modes as the creation
+// modal (person / user group / group conversation id) but no secret text/file —
+// the secret is already stored. Exactly one recipient mode may be set.
+export function buildShareModal(secretId: string, userGroups: UserGroupOption[] = []) {
+  return {
+    type: 'modal',
+    callback_id: 'secret_share',
+    title: { type: 'plain_text', text: 'Share Secret', emoji: true },
+    submit: { type: 'plain_text', text: 'Forward', emoji: true },
+    close: { type: 'plain_text', text: 'Cancel', emoji: true },
+    private_metadata: secretId,
+    blocks: [
+      {
+        type: 'context',
+        elements: [
+          { type: 'mrkdwn', text: 'Send this existing secret to more people. Each gets their own one-time View Secret DM.' },
+        ],
+      },
+      {
+        type: 'input',
+        block_id: 'recipient_block',
+        element: {
+          type: 'conversations_select',
+          placeholder: { type: 'plain_text', text: 'Select a person or channel', emoji: true },
+          action_id: 'recipient',
+          filter: { include: ['im', 'public', 'private'], exclude_bot_users: true },
+        },
+        label: { type: 'plain_text', text: 'Recipient', emoji: true },
+        optional: true,
+      },
+      {
+        type: 'input',
+        block_id: 'usergroup_block',
+        element: {
+          type: 'static_select',
+          placeholder: { type: 'plain_text', text: 'Select a user group', emoji: true },
+          action_id: 'usergroup',
+          options: usergroupOptions(userGroups),
+        },
+        label: { type: 'plain_text', text: 'User Group (optional)', emoji: true },
+        optional: true,
+      },
+      {
+        type: 'input',
+        block_id: 'mpim_block',
+        element: {
+          type: 'plain_text_input',
+          action_id: 'mpim_id',
+          placeholder: { type: 'plain_text', text: 'e.g. C0CEBDXC2GY or a Slack conversation link', emoji: true },
+        },
+        label: { type: 'plain_text', text: 'Group Conversation ID (optional)', emoji: true },
+        optional: true,
+      },
+    ],
+  }
+}
+
+// List current recipients of a secret so the sender can revoke one person's
+// access individually (e.g. undo a mistaken forward) without revoking everyone.
+export function buildManageAccessModal(secretId: string, recipients: Array<{ userId: string }>) {
+  const blocks: any[] = [
+    {
+      type: 'context',
+      elements: [
+        { type: 'mrkdwn', text: recipients.length > 0
+          ? `Remove a single recipient's access. *Revoke* still removes everyone at once.`
+          : `No other recipients yet.` },
+      ],
+    },
+  ]
+
+  for (const r of recipients) {
+    blocks.push({
+      type: 'section',
+      text: { type: 'mrkdwn', text: `<@${r.userId}>` },
+      accessory: {
+        type: 'button',
+        text: { type: 'plain_text', text: '🗑 Remove', emoji: true },
+        style: 'danger',
+        action_id: 'secret:manage-remove',
+        value: r.userId,
+      },
+    })
+  }
+
+  return {
+    type: 'modal',
+    callback_id: 'secret_manage',
+    title: { type: 'plain_text', text: 'Manage Access', emoji: true },
+    close: { type: 'plain_text', text: 'Done', emoji: true },
+    private_metadata: secretId,
+    blocks,
+  }
 }

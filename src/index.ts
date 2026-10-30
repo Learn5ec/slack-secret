@@ -9,8 +9,8 @@ import { processPurgeExpiredSecret } from './queue/expiry-job'
 import { processChannelDelivery } from './queue/channel-delivery-job'
 import { slackClient } from './slack/client'
 import { handleSecretCommand } from './bot/commands'
-import { handleModalSubmit } from './bot/modals'
-import { handleViewAction, handleViewedByAction, handleCancelAction, handleHideAction, handleRevokeConfirm } from './bot/actions'
+import { handleModalSubmit, handleShareSubmit } from './bot/modals'
+import { handleViewAction, handleViewedByAction, handleCancelAction, handleHideAction, handleRevokeConfirm, handleShareAction, handleManageAction, handleManageRemoveAction } from './bot/actions'
 import { purgeSecret } from './bot/secret-cleanup'
 import { startConfigPolling, stopConfigPolling, getConfig } from './config/timing'
 import { initHealthCheck, closeHealthCheck } from './health'
@@ -172,6 +172,46 @@ async function main() {
 
   app.action('secret:hide', async (args) => {
     await handleHideAction({
+      action: args.action as any,
+      ack: args.ack,
+      body: args.body as any,
+      client: args.client as any,
+    })
+  })
+
+  // Forward an existing secret to more recipients (sender-only Share button).
+  app.action('secret:share', async (args) => {
+    await handleShareAction({
+      action: args.action as any,
+      ack: args.ack,
+      body: args.body as any,
+      client: args.client as any,
+      trigger_id: (args.body as any).trigger_id,
+    })
+  })
+
+  app.view('secret_share', async ({ view, ack, body, client }) => {
+    await handleShareSubmit({
+      view,
+      ack,
+      body,
+      client: client as any,
+    })
+  })
+
+  // Per-recipient access management (sender-only Manage button + Remove).
+  app.action('secret:manage', async (args) => {
+    await handleManageAction({
+      action: args.action as any,
+      ack: args.ack,
+      body: args.body as any,
+      client: args.client as any,
+      trigger_id: (args.body as any).trigger_id,
+    })
+  })
+
+  app.action('secret:manage-remove', async (args) => {
+    await handleManageRemoveAction({
       action: args.action as any,
       ack: args.ack,
       body: args.body as any,

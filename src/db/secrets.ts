@@ -115,6 +115,15 @@ export function createClient(pool: Pool) {
     )
   },
 
+  // Clear the 1:1 recipient placeholder reference (used when the sender removes
+  // that specific recipient's access individually).
+  clearRecipientDmMessage: async (secretId: string): Promise<void> => {
+    await pool.query(
+      'UPDATE secrets SET recipient_dm_channel_id = NULL, recipient_dm_ts = NULL WHERE id = $1',
+      [secretId],
+    )
+  },
+
   setViewedByMessage: async (secretId: string, channelId: string, ts: string): Promise<void> => {
     await pool.query(
       'UPDATE secrets SET viewed_by_channel_id = $1, viewed_by_ts = $2 WHERE id = $3',

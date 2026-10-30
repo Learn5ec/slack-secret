@@ -491,6 +491,190 @@ export async function handleModalSubmit(args: ModalSubmitArgs): Promise<void> {
   }
 }
 
+// Forward an EXISTING secret to more recipients — no re-encryption, no new
+// announcement. Reuses the same three recipient modes as the creation modal
+// (person / user group / group-conversation id) plus a channel selected in the
+// dropdown. Each target is fanned out as per-person "View Secret" DMs by the
+// shared delivery worker, which also records the allow-list grant so forwarded
+// people pass a single-mode secret's reveal check.
+export async function handleShareSubmit(args: ModalSubmitArgs): Promise<void> {
+  const { view, ack, body, client } = args
+
+  await ack()
+
+  const values = view.state.values
+  const senderId = body.user.id
+  const secretId = (view as any).private_metadata as string | undefined
+
+  async function notifySender(text: string): Promise<void> {
+    try {
+      const dm = await client.conversations.open({ users: senderId })
+      if (dm.channel?.id) await client.chat.postMessage({ channel: dm.channel.id, text })
+    } catch (err: any) {
+      logger.warn({ err, senderId }, 'Failed to DM sender during share submit')
+    }
+  }
+
+  try {
+    if (!secretId) {
+      logger.warn('Share submit without secretId in private_metadata')
+      return
+    }
+
+    const dbs = createDatabases(pool)
+    const secret = await dbs.secrets.getSecretById(secretId)
+    if (!secret) {
+      await notifySender('⚠️ That secret no longer exists.')
+      return
+    }
+    if (secret.sender_id !== senderId) {
+      logger.warn({ secretId, senderId }, 'Non-sender attempted to forward a secret')
+      await notifySender('⚠️ Only the person who shared this secret can forward it.')
+      return
+    }
+    if (secret.status !== 'pending') {
+      await notifySender('⚠️ This secret is no longer available to forward (it has been revoked or expired).')
+      return
+    }
+
+    // Same three-mode extraction as the creation modal.
+    const selectedConv: string | null =
+      (values.recipient_block?.recipient as any)?.selected_conversation ?? null
+    const selectedUserGroupId: string | null =
+      (values.usergroup_block?.usergroup as any)?.selected_option?.value ?? null
+    const mpimInput = ((values.mpim_block?.mpim_id as any)?.value ?? '').trim()
+    const selectedMpimId: string | null = mpimInput ? extractChannelId(mpimInput) : null
+
+    const modesSet = [selectedConv, selectedUserGroupId, selectedMpimId].filter(Boolean)
+    if (modesSet.length > 1) {
+      await notifySender(
+        '⚠️ Please choose only one recipient type: a recipient (person/channel), a user group, OR a group conversation ID.',
+      )
+      return
+    }
+    if (modesSet.length === 0) {
+      await notifySender('⚠️ Please select a recipient, a user group, or a group conversation ID before forwarding.')
+      return
+    }
+
+    const config = getConfig()
+    const botUid = await getBotUserId(client)
+
+    // Enqueue a fan-out job and confirm to the sender. `noun` is display-only.
+    async function fanOut(payload: {
+      recipientKind: 'channel' | 'usergroup' | 'mpim'
+      recipientId: string
+      noun: string
+    }): Promise<void> {
+      await channelDeliveryQueue.add(`forward-${payload.recipientKind}-secret`, {
+        secretId: secretId!,
+        recipientKind: payload.recipientKind,
+        recipientId: payload.recipientId,
+        senderId,
+      })
+      logger.info({ secretId, recipientId: payload.recipientId, kind: payload.recipientKind }, 'Forward fan-out enqueued')
+      await notifySender(`🔗 Forwarded to ${payload.noun}. Each person gets their own one-time View Secret DM.`)
+    }
+
+    // 1) User Group → expand + DM each member (works without bot membership).
+    if (selectedUserGroupId) {
+      let count = 0
+      try {
+        const ug = await client.usergroups.users.list({ usergroup: selectedUserGroupId, include_disabled: false })
+        count = ((ug.users as string[]) ?? []).filter((m) => m !== senderId && m !== botUid).length
+      } catch (err) {
+        logger.warn({ err, selectedUserGroupId }, 'Could not resolve user group members for forward cap check')
+      }
+      if (count > config.security.max_channel_members) {
+        await notifySender(
+          `⚠️ That user group has ${count} members, exceeding the cap of ${config.security.max_channel_members}. Not forwarded.`,
+        )
+        return
+      }
+      await fanOut({ recipientKind: 'usergroup', recipientId: selectedUserGroupId, noun: `the user group (${count})` })
+      return
+    }
+
+    // 2) Group Conversation ID field → must be an mpim the bot is a member of.
+    if (selectedMpimId) {
+      try {
+        const info = await client.conversations.info({ channel: selectedMpimId })
+        if (!info.ok || !(info.channel as any)?.is_mpim) {
+          await notifySender('⚠️ That is not a group conversation (multi-person DM). Forward to a person, a channel, or a user group instead.')
+          return
+        }
+      } catch (err: any) {
+        logger.warn({ err, selectedMpimId }, 'Could not access group conversation for forward; bot likely not a member')
+        await notifySender('⚠️ The bot could not access that group conversation. Please add @SecretBot to it first, then try again.')
+        return
+      }
+      await fanOut({ recipientKind: 'mpim', recipientId: selectedMpimId, noun: 'the group conversation' })
+      return
+    }
+
+    // 3) conversations_select value: C/G = channel fan-out, U = person, D = resolve DM.
+    if (selectedConv!.startsWith('C') || selectedConv!.startsWith('G')) {
+      let isMpim = false
+      try {
+        const info = await client.conversations.info({ channel: selectedConv! })
+        if (!info.ok || !info.channel?.is_member) {
+          await notifySender(`⚠️ The bot is not in <#${selectedConv}>. Please invite @SecretBot to that conversation first, then try again.`)
+          return
+        }
+        isMpim = !!(info.channel as any).is_mpim
+      } catch (err: any) {
+        logger.warn({ err, selectedConv }, 'Could not access conversation for forward; bot likely not a member')
+        await notifySender('⚠️ The bot could not access that conversation. Please add @SecretBot to it first, then try again.')
+        return
+      }
+      const memberIds = await resolveChannelMembers(client, selectedConv!)
+      const memberCount = memberIds.filter((m) => m !== senderId && m !== botUid).length
+      if (memberCount > config.security.max_channel_members) {
+        await notifySender(
+          `⚠️ That conversation has ${memberCount} members, exceeding the cap of ${config.security.max_channel_members}. Not forwarded.`,
+        )
+        return
+      }
+      // No announcement on a forward — the secret already has one wherever it was
+      // first shared; this only adds new recipient DMs.
+      await fanOut({
+        recipientKind: isMpim ? 'mpim' : 'channel',
+        recipientId: selectedConv!,
+        noun: isMpim ? 'the group conversation' : `the channel (${memberCount})`,
+      })
+      return
+    }
+
+    // Person (U... direct, or D... DM conversation to resolve).
+    let personId: string | null = null
+    if (selectedConv!.startsWith('U')) {
+      personId = selectedConv
+    } else {
+      const convInfo = await client.conversations.info({ channel: selectedConv! })
+      const members: string[] = (convInfo.channel as any)?.members || []
+      personId = members.find((m: string) => m !== senderId) ?? null
+    }
+    if (!personId) {
+      await notifySender('⚠️ Could not resolve the recipient you selected. Please try again.')
+      return
+    }
+    if (personId === senderId) {
+      await notifySender('⚠️ You cannot forward a secret to yourself — you already have it.')
+      return
+    }
+    await channelDeliveryQueue.add('forward-user-secret', {
+      secretId,
+      recipientKind: 'users',
+      recipientIds: [personId],
+      senderId,
+    })
+    logger.info({ secretId, personId }, 'Forward to person enqueued')
+    await notifySender('🔗 Forwarded. They got their own one-time View Secret DM.')
+  } catch (err: any) {
+    logger.error({ err, errMessage: err.message }, 'Error processing forward (share) submission')
+  }
+}
+
 // Accept a raw Slack conversation id (e.g. "C0CEBDXC2GY") or a pasted Slack
 // conversation link (e.g. https://x.slack.com/app_redirect?channel=C0CEBDXC2GY)
 // and return just the id. Falls back to the trimmed input if no id-shaped token

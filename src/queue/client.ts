@@ -18,9 +18,12 @@ export interface ChannelDeliveryPayload {
   secretId: string
   // 'channel' posts an announcement elsewhere + fans out to channel members;
   // 'usergroup' expands a Slack User Group and DMs each member;
-  // 'mpim' resolves a group conversation's members and DMs each one.
-  recipientKind?: 'channel' | 'usergroup' | 'mpim'
+  // 'mpim' resolves a group conversation's members and DMs each one;
+  // 'users' DMs an explicit list of user-IDs (a forward to specific people).
+  recipientKind?: 'channel' | 'usergroup' | 'mpim' | 'users'
   recipientId?: string
+  // Explicit user-IDs for the 'users' kind (forward to specific people).
+  recipientIds?: string[]
   // Legacy alias for recipientId (channel), kept so any in-flight job still runs.
   channelId?: string
   senderId: string

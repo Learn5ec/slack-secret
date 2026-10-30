@@ -59,6 +59,15 @@ export function createClient(pool: Pool) {
       )
       return result.rowCount ?? 0
     },
+
+    // Remove a single member's placeholder-DM row (per-recipient access removal).
+    deleteBySecretAndMember: async (secretId: string, memberId: string): Promise<number> => {
+      const result = await pool.query(
+        'DELETE FROM channel_member_dms WHERE secret_id = $1 AND member_id = $2',
+        [secretId, memberId],
+      )
+      return result.rowCount ?? 0
+    },
   }
 
   return client

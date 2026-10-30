@@ -8,8 +8,10 @@ import { getConfig } from '../config/timing'
 
 export interface ChannelDeliveryPayload {
   secretId: string
-  recipientKind?: 'channel' | 'usergroup' | 'mpim'
+  recipientKind?: 'channel' | 'usergroup' | 'mpim' | 'users'
   recipientId?: string
+  // Explicit user-IDs for the 'users' kind (forward to specific people).
+  recipientIds?: string[]
   // Legacy alias for recipientId (channel), kept so any in-flight job still runs.
   channelId?: string
   senderId: string
@@ -46,7 +48,9 @@ export async function processChannelDelivery(
   const kind = job.data.recipientKind ?? 'channel'
   const recipientId = job.data.recipientId ?? job.data.channelId
 
-  if (!recipientId) {
+  // 'users' forwards target an explicit list of user-IDs (no conversation to
+  // enumerate); every other kind resolves members from recipientId.
+  if (kind !== 'users' && !recipientId) {
     logger.warn({ secretId }, 'Fan-out job has no recipientId/channelId, skipping')
     return
   }
@@ -57,13 +61,18 @@ export async function processChannelDelivery(
     return
   }
 
-  const memberIds =
-    kind === 'usergroup'
-      ? await resolveGroupMembers(client, recipientId)
-      : await resolveChannelMembers(client, recipientId)
+  let memberIds: string[]
+  if (kind === 'users') {
+    memberIds = job.data.recipientIds ?? []
+  } else if (kind === 'usergroup') {
+    memberIds = await resolveGroupMembers(client, recipientId!)
+  } else {
+    memberIds = await resolveChannelMembers(client, recipientId!)
+  }
 
   const deliverable = memberIds.filter((m) => m !== senderId && m !== botUserId)
-  const noun = kind === 'usergroup' ? 'user group' : kind === 'mpim' ? 'group conversation' : 'channel'
+  const noun =
+    kind === 'usergroup' ? 'user group' : kind === 'mpim' ? 'group conversation' : kind === 'users' ? 'chat' : 'channel'
 
   // Helper to DM the sender about delivery problems.
   async function notifySender(text: string): Promise<void> {
@@ -83,8 +92,20 @@ export async function processChannelDelivery(
 
   let delivered = 0
   let failed = 0
+  let skipped = 0
   for (const memberId of deliverable) {
     try {
+      // Dedup: a repeated forward to the same audience must not spam a second
+      // "View Secret" DM to someone who already has (or already viewed) it.
+      const existingDm = await dbs.channelMemberDms.getBySecretAndMember(secretId, memberId)
+      const existingView = await dbs.views.getView(secretId, memberId)
+      if (existingDm || (existingView && existingView.status === 'delivered')) {
+        skipped++
+        // Still ensure the forward grant exists (harmless no-op if present).
+        if (kind === 'users') await dbs.allowedViewers.create(secretId, memberId)
+        continue
+      }
+
       const dmResult = await client.conversations.open({ users: memberId })
       const dmChannelId = dmResult.channel?.id
       if (!dmChannelId) {
@@ -112,6 +133,9 @@ export async function processChannelDelivery(
           dmChannelId,
           dmTs: postResult.ts,
         })
+        // Forwarded people must pass the single-mode reveal check — add them to
+        // the explicit allow-list (no-op for multi-mode secrets, which ignore it).
+        if (kind === 'users') await dbs.allowedViewers.create(secretId, memberId)
         delivered++
       } else {
         failed++
@@ -131,5 +155,5 @@ export async function processChannelDelivery(
     )
   }
 
-  logger.info({ secretId, recipientId, kind, delivered, failed, total: deliverable.length }, 'Fan-out delivery complete')
+  logger.info({ secretId, recipientId, kind, delivered, failed, skipped, total: deliverable.length }, 'Fan-out delivery complete')
 }

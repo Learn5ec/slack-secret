@@ -4,18 +4,20 @@ import { decryptSecret, decryptFile } from '../crypto/secret'
 import { getMasterKey } from '../crypto/master'
 import { createDatabases } from '../db'
 import { pool } from '../db/client'
-import { buildViewedByBlocks, buildRevealedSecretBlocks, buildRevokeConfirmationModal } from '../slack/view-builder'
+import { buildViewedByBlocks, buildRevealedSecretBlocks, buildRevokeConfirmationModal, buildShareModal, buildManageAccessModal } from '../slack/view-builder'
+import { fetchUserGroups } from './commands'
 import { deleteSlackMessage, deleteSlackFile } from '../slack/messages'
 import { deleteDmMessageQueue } from '../queue/client'
 import { getConfig } from '../config/timing'
 import { markdownToSlackBlocks } from '../markdown/converter'
 import { formatIST } from '../utils/time'
 import { readLocalFile } from '../utils/file-ops'
-import { purgeSecret } from './secret-cleanup'
+import { purgeSecret, removeViewerAccess } from './secret-cleanup'
 
 type ActionBody = {
   user: { id: string }
   channel?: { id: string }
+  view?: { id: string; private_metadata?: string }
   message?: {
     ts: string
     metadata?: {
@@ -96,10 +98,17 @@ async function handleRecipientView(secret: any, viewerId: string, client: WebCli
     return
   }
 
-  // Check if this viewer is allowed (for single-mode)
+  // Check if this viewer is allowed (for single-mode).
+  // 'single' locks to allowed_viewer_id, but a forwarded secret also grants anyone
+  // in the explicit allow-list (secret_allowed_viewers). 'multi' is unchanged —
+  // any holder of the per-person DM button may view (that's how channel/group
+  // shares already work).
   if (secret.visibility_mode === 'single' && secret.allowed_viewer_id && secret.allowed_viewer_id !== viewerId) {
-    logger.warn({ secretId: secret.id, viewerId }, 'Viewer not allowed')
-    return
+    const inAllowList = await dbs.allowedViewers.isAllowed(secret.id, viewerId)
+    if (!inAllowList) {
+      logger.warn({ secretId: secret.id, viewerId }, 'Viewer not allowed')
+      return
+    }
   }
 
   const senderName = `<@${secret.sender_id}>`
@@ -471,6 +480,142 @@ export async function handleCancelAction(args: ActionArgs): Promise<void> {
     }
   } catch (err: any) {
     logger.error({ err, secretId, userId }, 'Unexpected error in cancel action')
+  }
+}
+
+export async function handleShareAction(args: ActionArgs): Promise<void> {
+  const { action, ack, body, client } = args
+
+  const secretId = action.value
+  const userId = body.user.id
+
+  logger.info({ secretId, userId }, 'Share action triggered')
+
+  try {
+    const dbs = createDatabases(pool)
+    const secret = await dbs.secrets.getSecretById(secretId)
+
+    if (!secret) {
+      await notifyViewer(client, body, userId, '🔒 Secret not found.')
+      await ack()
+      return
+    }
+
+    // Only the sender can forward.
+    if (userId !== secret.sender_id) {
+      logger.warn({ userId, secretId }, 'Non-sender attempted Share')
+      await notifyViewer(client, body, userId, '🔒 Only the sender can share this secret.')
+      await ack()
+      return
+    }
+
+    await ack()
+
+    try {
+      const userGroups = await fetchUserGroups(client)
+      await client.views.open({
+        trigger_id: args.trigger_id!,
+        view: buildShareModal(secretId, userGroups) as any,
+      })
+    } catch (err: any) {
+      logger.error({ err, secretId, userId }, 'Failed to open share modal')
+    }
+  } catch (err: any) {
+    logger.error({ err, secretId, userId }, 'Unexpected error in share action')
+  }
+}
+
+// Current recipients of a secret = union of fan-out member rows, per-viewer
+// view rows (delivered), and the original 1:1 recipient — minus the sender.
+// Because the fan-out worker writes a channel_member_dms row per member, this
+// naturally includes channel / group-conversation / user-group members too, so
+// every share type gets the identical Manage/remove capability.
+async function computeRecipientIds(dbs: any, secret: any): Promise<string[]> {
+  const ids = new Set<string>()
+  const channelDms = await dbs.channelMemberDms.getBySecretId(secret.id)
+  for (const dm of channelDms) ids.add(dm.member_id)
+  const views = await dbs.views.getViewsBySecretId(secret.id)
+  for (const v of views) if (v.status === 'delivered') ids.add(v.viewer_id)
+  if (secret.allowed_viewer_id) ids.add(secret.allowed_viewer_id)
+  ids.delete(secret.sender_id)
+  return [...ids]
+}
+
+export async function handleManageAction(args: ActionArgs): Promise<void> {
+  const { action, ack, body, client } = args
+  const secretId = action.value
+  const userId = body.user.id
+
+  logger.info({ secretId, userId }, 'Manage access action triggered')
+
+  try {
+    const dbs = createDatabases(pool)
+    const secret = await dbs.secrets.getSecretById(secretId)
+
+    if (!secret) {
+      await notifyViewer(client, body, userId, '🔒 Secret not found.')
+      await ack()
+      return
+    }
+    if (userId !== secret.sender_id) {
+      logger.warn({ userId, secretId }, 'Non-sender attempted Manage access')
+      await notifyViewer(client, body, userId, '🔒 Only the sender can manage access to this secret.')
+      await ack()
+      return
+    }
+
+    await ack()
+
+    try {
+      const recipients = await computeRecipientIds(dbs, secret)
+      await client.views.open({
+        trigger_id: args.trigger_id!,
+        view: buildManageAccessModal(secretId, recipients.map((id) => ({ userId: id }))) as any,
+      })
+    } catch (err: any) {
+      logger.error({ err, secretId, userId }, 'Failed to open manage access modal')
+    }
+  } catch (err: any) {
+    logger.error({ err, secretId, userId }, 'Unexpected error in manage action')
+  }
+}
+
+export async function handleManageRemoveAction(args: ActionArgs): Promise<void> {
+  const { action, ack, body, client } = args
+  // On a Remove button, action.value is the RECIPIENT (viewer) id; the secret id
+  // rides on the modal's private_metadata.
+  const viewerId = action.value
+  const secretId = body.view?.private_metadata ?? ''
+  const userId = body.user.id
+
+  await ack()
+
+  try {
+    const dbs = createDatabases(pool)
+    const secret = await dbs.secrets.getSecretById(secretId)
+
+    if (!secret) {
+      logger.warn({ secretId }, 'Manage remove: secret not found')
+      return
+    }
+    if (userId !== secret.sender_id) {
+      logger.warn({ userId, secretId }, 'Non-sender attempted manage remove')
+      return
+    }
+
+    await removeViewerAccess(client, dbs, secret, viewerId)
+
+    // Re-render the modal in place with the updated recipient list.
+    const recipients = await computeRecipientIds(dbs, secret)
+    if (body.view?.id) {
+      await client.views.update({
+        view_id: body.view.id,
+        view: buildManageAccessModal(secretId, recipients.map((id) => ({ userId: id }))) as any,
+      })
+    }
+    logger.info({ secretId, viewerId, remaining: recipients.length }, 'Removed viewer access via Manage')
+  } catch (err: any) {
+    logger.error({ err, secretId, viewerId }, 'Unexpected error in manage remove action')
   }
 }
 

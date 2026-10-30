@@ -143,3 +143,64 @@ export async function purgeSecret(
   await dbs.secrets.hardDeleteSecretsForId(secretId)
   logger.info({ secretId }, 'Secret hard-deleted from DB')
 }
+
+// Remove ONE viewer's access to an otherwise-live secret: their placeholder DM,
+// any revealed copy, the delete-timer job, and the allow-list grant. Touches
+// ONLY that viewer — every other recipient (and the secret itself) is left
+// intact. This is the per-recipient slice of purgeSecret; each person's access
+// is an individual (secret_id, viewer_id) row, so removal has no blast radius.
+export async function removeViewerAccess(
+  client: WebClient,
+  dbs: any,
+  secret: any,
+  viewerId: string,
+): Promise<void> {
+  const secretId = secret.id
+
+  // 1) Their revealed copy (per-viewer view-once message + file), if any.
+  const view = await dbs.views.getView(secretId, viewerId)
+  if (view && view.status === 'delivered') {
+    if (view.dm_channel_id) {
+      if (view.dm_ts) await deleteSlackMessage(client, view.dm_channel_id, view.dm_ts)
+      if (view.file_upload_id) await deleteSlackFile(client, view.file_upload_id)
+      if (view.file_dm_ts) await deleteSlackMessage(client, view.dm_channel_id, view.file_dm_ts)
+    }
+    // Cancel just this view's pending auto-delete job.
+    const pendingJobs = await deleteDmMessageQueue.getJobs(['waiting', 'active', 'delayed'])
+    for (const job of pendingJobs) {
+      if (job.data.viewId === view.id) {
+        try {
+          await job.remove()
+        } catch (err: any) {
+          logger.warn({ jobId: job.id, viewId: view.id, err: err.message }, 'Failed to cancel delete job on remove')
+        }
+      }
+    }
+    await dbs.views.markViewAsDeleted(view.id)
+    logger.info({ secretId, viewerId, viewId: view.id }, 'Removed viewer revealed copy')
+  }
+
+  // 2) Their un-opened "View Secret" placeholder DM (fan-out member / forward).
+  const channelDm = await dbs.channelMemberDms.getBySecretAndMember(secretId, viewerId)
+  if (channelDm) {
+    if (channelDm.dm_ts) await deleteSlackMessage(client, channelDm.dm_channel_id, channelDm.dm_ts)
+    await dbs.channelMemberDms.deleteBySecretAndMember(secretId, viewerId)
+    logger.info({ secretId, viewerId }, 'Removed viewer placeholder DM (channel_member_dms)')
+  }
+
+  // 3) If they were the original 1:1 recipient, remove that placeholder too.
+  if (
+    secret.allowed_viewer_id === viewerId &&
+    secret.recipient_dm_channel_id &&
+    secret.recipient_dm_ts
+  ) {
+    await deleteSlackMessage(client, secret.recipient_dm_channel_id, secret.recipient_dm_ts)
+    await dbs.secrets.clearRecipientDmMessage(secretId)
+    logger.info({ secretId, viewerId }, 'Removed original recipient DM placeholder')
+  }
+
+  // 4) Drop the explicit forward grant so they fail the single-mode reveal check.
+  await dbs.allowedViewers.deleteBySecretAndViewer(secretId, viewerId)
+
+  logger.info({ secretId, viewerId }, 'Viewer access removed')
+}

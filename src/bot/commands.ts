@@ -4,7 +4,7 @@ import { buildSecretModal, UserGroupOption } from '../slack/view-builder'
 // Fetch the workspace's selectable User Groups for the modal picker.
 // Returns [] on any failure (e.g. free plan / no usergroups:read) so the
 // modal still opens — the group picker just shows "No user groups available".
-async function fetchUserGroups(client: any): Promise<UserGroupOption[]> {
+export async function fetchUserGroups(client: any): Promise<UserGroupOption[]> {
   try {
     const result = await client.usergroups.list({ include_count: true, include_disabled: false })
     if (!result.ok || !Array.isArray(result.usergroups)) return []
