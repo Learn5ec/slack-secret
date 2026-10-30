@@ -337,12 +337,6 @@ right below the file when there's no text message to carry it.
 
 ---
 
-## 🐛 Bug Tracker
-
-See [bug-tracker.csv](./bug-tracker.csv) for full history of bugs and fixes.
-
----
-
 ## 📝 License
 
 Private - All rights reserved.
