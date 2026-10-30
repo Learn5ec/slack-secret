@@ -74,6 +74,31 @@ export async function processChannelDelivery(
   const noun =
     kind === 'usergroup' ? 'user group' : kind === 'mpim' ? 'group conversation' : kind === 'users' ? 'chat' : 'channel'
 
+  // Human-readable entity the secret reached the recipient through ("via #general",
+  // "via @engineering", "via a group conversation"). Best-effort: falls back to a
+  // generic label if the name lookup fails. Person ('users') forwards have no
+  // entity to name.
+  async function resolveEntityLabel(): Promise<string | null> {
+    if (kind === 'users') return null
+    try {
+      if (kind === 'channel') {
+        const info = await client.conversations.info({ channel: recipientId! })
+        const name = (info.channel as any)?.name
+        return name ? `#${name}` : 'a channel'
+      }
+      if (kind === 'usergroup') {
+        const groups = await client.usergroups.list({ include_count: false, include_disabled: true })
+        const g = (groups.usergroups ?? []).find((x: any) => x.id === recipientId)
+        return g ? `@${g.handle ?? g.name}` : 'a user group'
+      }
+      return 'a group conversation'
+    } catch (err: any) {
+      logger.warn({ err, kind, recipientId }, 'Could not resolve entity label for recipient DM')
+      return kind === 'channel' ? 'a channel' : kind === 'usergroup' ? 'a user group' : 'a group conversation'
+    }
+  }
+  const entityLabel = await resolveEntityLabel()
+
   // Helper to DM the sender about delivery problems.
   async function notifySender(text: string): Promise<void> {
     try {
@@ -93,6 +118,10 @@ export async function processChannelDelivery(
   let delivered = 0
   let failed = 0
   let skipped = 0
+  // Members who already received this secret (from an earlier target in a
+  // combined submit, or a prior Share/forward). We skip them and report them to
+  // the sender so a person sitting in several selected groups isn't re-DM'd.
+  const alreadyHad: string[] = []
   for (const memberId of deliverable) {
     try {
       // Dedup: a repeated forward to the same audience must not spam a second
@@ -101,8 +130,10 @@ export async function processChannelDelivery(
       const existingView = await dbs.views.getView(secretId, memberId)
       if (existingDm || (existingView && existingView.status === 'delivered')) {
         skipped++
-        // Still ensure the forward grant exists (harmless no-op if present).
-        if (kind === 'users') await dbs.allowedViewers.create(secretId, memberId)
+        alreadyHad.push(memberId)
+        // Still ensure the reveal grant exists (harmless no-op if present, and
+        // required for a single-mode secret reached via a fan-out target).
+        await dbs.allowedViewers.create(secretId, memberId)
         continue
       }
 
@@ -114,12 +145,12 @@ export async function processChannelDelivery(
       }
 
       const senderName = `<@${senderId}>`
-      const blocks = buildRecipientPlaceholderBlocks(secret.type, senderName, null, secretId)
+      const blocks = buildRecipientPlaceholderBlocks(secret.type, senderName, null, secretId, entityLabel)
 
       const postResult = await client.chat.postMessage({
         channel: dmChannelId,
         blocks,
-        text: `${senderName} shared a secret with your ${noun}. Click to view.`,
+        text: `${senderName} shared a secret with you${entityLabel ? ` via ${entityLabel}` : ''}. Click to view.`,
       })
 
       if (postResult.ok && postResult.ts) {
@@ -132,10 +163,14 @@ export async function processChannelDelivery(
           memberId,
           dmChannelId,
           dmTs: postResult.ts,
+          recipientKind: kind,
+          recipientId: recipientId ?? null,
         })
-        // Forwarded people must pass the single-mode reveal check — add them to
-        // the explicit allow-list (no-op for multi-mode secrets, which ignore it).
-        if (kind === 'users') await dbs.allowedViewers.create(secretId, memberId)
+        // Recipients must pass the single-mode reveal check — add them to the
+        // explicit allow-list (no-op for multi-mode secrets, which ignore it).
+        // Recorded for every kind so a single-mode secret forwarded to a group
+        // still lets its members reveal.
+        await dbs.allowedViewers.create(secretId, memberId)
         delivered++
       } else {
         failed++
@@ -155,5 +190,18 @@ export async function processChannelDelivery(
     )
   }
 
-  logger.info({ secretId, recipientId, kind, delivered, failed, skipped, total: deliverable.length }, 'Fan-out delivery complete')
+  // Tell the sender who we intentionally skipped because they already have the
+  // secret (shared via another selected target or an earlier forward), so
+  // overlapping groups don't result in silent duplicate-DM suppression.
+  if (alreadyHad.length > 0) {
+    const names = alreadyHad.map((m) => `<@${m}>`).join(', ')
+    await notifySender(
+      `🔒 ${names} already received this secret, so it wasn't sent to them again.`,
+    )
+  }
+
+  logger.info(
+    { secretId, recipientId, kind, delivered, failed, skipped, alreadyHad: alreadyHad.length, total: deliverable.length },
+    'Fan-out delivery complete',
+  )
 }

@@ -529,7 +529,7 @@ export async function handleShareAction(args: ActionArgs): Promise<void> {
 // view rows (delivered), and the original 1:1 recipient — minus the sender.
 // Because the fan-out worker writes a channel_member_dms row per member, this
 // naturally includes channel / group-conversation / user-group members too, so
-// every share type gets the identical Manage/remove capability.
+// every share type gets the identical Manage/remove capability (individual only).
 async function computeRecipientIds(dbs: any, secret: any): Promise<string[]> {
   const ids = new Set<string>()
   const channelDms = await dbs.channelMemberDms.getBySecretId(secret.id)
@@ -539,6 +539,17 @@ async function computeRecipientIds(dbs: any, secret: any): Promise<string[]> {
   if (secret.allowed_viewer_id) ids.add(secret.allowed_viewer_id)
   ids.delete(secret.sender_id)
   return [...ids]
+}
+
+// Build and open (or re-render) the Manage modal with the current recipient list.
+async function openManageView(client: any, dbs: any, secret: any, triggerOrViewId: { trigger_id?: string; view_id?: string }): Promise<void> {
+  const recipients = await computeRecipientIds(dbs, secret)
+  const view = buildManageAccessModal(secret.id, recipients.map((id) => ({ userId: id }))) as any
+  if (triggerOrViewId.view_id) {
+    await client.views.update({ view_id: triggerOrViewId.view_id, view })
+  } else {
+    await client.views.open({ trigger_id: triggerOrViewId.trigger_id!, view })
+  }
 }
 
 export async function handleManageAction(args: ActionArgs): Promise<void> {
@@ -567,11 +578,7 @@ export async function handleManageAction(args: ActionArgs): Promise<void> {
     await ack()
 
     try {
-      const recipients = await computeRecipientIds(dbs, secret)
-      await client.views.open({
-        trigger_id: args.trigger_id!,
-        view: buildManageAccessModal(secretId, recipients.map((id) => ({ userId: id }))) as any,
-      })
+      await openManageView(client, dbs, secret, { trigger_id: args.trigger_id })
     } catch (err: any) {
       logger.error({ err, secretId, userId }, 'Failed to open manage access modal')
     }
@@ -606,14 +613,10 @@ export async function handleManageRemoveAction(args: ActionArgs): Promise<void> 
     await removeViewerAccess(client, dbs, secret, viewerId)
 
     // Re-render the modal in place with the updated recipient list.
-    const recipients = await computeRecipientIds(dbs, secret)
     if (body.view?.id) {
-      await client.views.update({
-        view_id: body.view.id,
-        view: buildManageAccessModal(secretId, recipients.map((id) => ({ userId: id }))) as any,
-      })
+      await openManageView(client, dbs, secret, { view_id: body.view.id })
     }
-    logger.info({ secretId, viewerId, remaining: recipients.length }, 'Removed viewer access via Manage')
+    logger.info({ secretId, viewerId }, 'Removed viewer access via Manage')
   } catch (err: any) {
     logger.error({ err, secretId, viewerId }, 'Unexpected error in manage remove action')
   }

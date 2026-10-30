@@ -93,12 +93,20 @@ export async function purgeSecret(
   }
   logger.info({ secretId, channelDmCount: channelDms.length }, 'Deleted channel member DM placeholders')
 
-  // Update channel announcement in-place (if any)
-  if (secret.channel_announcement_channel_id && secret.channel_announcement_ts) {
+  // Update every channel / group-conversation announcement in place. A secret may
+  // have announced in several conversations (one per channel/conversation it was
+  // shared or forwarded to), so iterate them all. Fall back to the legacy single
+  // reference if the per-conversation table is empty (pre-migration secrets).
+  const announcementTargets = await dbs.channelAnnouncements.getBySecretId(secretId)
+  const legacy =
+    announcementTargets.length === 0 && secret.channel_announcement_channel_id && secret.channel_announcement_ts
+      ? [{ channel_id: secret.channel_announcement_channel_id, ts: secret.channel_announcement_ts }]
+      : []
+  const allAnnouncements = [...announcementTargets, ...legacy]
+
+  for (const ann of allAnnouncements) {
     try {
-      const channelInfo = await client.conversations.info({
-        channel: secret.channel_announcement_channel_id,
-      })
+      const channelInfo = await client.conversations.info({ channel: ann.channel_id })
       // An mpim's real name is an "mpdm-…" slug; show "this group conversation"
       // instead of "#mpdm-…". Only channels with a real name get "#name".
       const isMpim = (channelInfo.channel as any)?.is_mpim === true
@@ -116,16 +124,16 @@ export async function purgeSecret(
           )
 
       await client.chat.update({
-        channel: secret.channel_announcement_channel_id,
-        ts: secret.channel_announcement_ts,
+        channel: ann.channel_id,
+        ts: ann.ts,
         blocks,
         text: reason === 'revoked'
           ? `${senderName} revoked a secret.`
           : `${senderName}'s secret expired.`,
       })
-      logger.info({ secretId, channelId: secret.channel_announcement_channel_id, ts: secret.channel_announcement_ts }, 'Channel announcement updated in-place')
+      logger.info({ secretId, channelId: ann.channel_id, ts: ann.ts }, 'Channel announcement updated in-place')
     } catch (err: any) {
-      logger.error({ err, secretId }, 'Failed to update channel announcement')
+      logger.error({ err, secretId, channelId: ann.channel_id }, 'Failed to update channel announcement')
     }
   }
 

@@ -30,6 +30,38 @@ export type ModalSubmitArgs = {
   client: WebClient
 }
 
+// Post the "X shared a secret in …" announcement into a channel / group
+// conversation and record it against the secret so revoke/expiry can update it
+// in place. Skips silently if this secret was already announced in this exact
+// conversation (e.g. forwarding the same secret to the same place twice).
+async function announceSecretInConversation(
+  client: WebClient,
+  dbs: ReturnType<typeof createDatabases>,
+  secretId: string,
+  senderId: string,
+  channelId: string,
+  kind: 'channel' | 'mpim',
+  channelName?: string | null,
+): Promise<void> {
+  const existing = await dbs.channelAnnouncements.getBySecretAndChannel(secretId, channelId)
+  if (existing) return
+
+  const senderName = `<@${senderId}>`
+  const label = kind === 'mpim' ? 'group conversation' : 'channel'
+  const blocks = buildChannelAnnouncementBlocks(senderName, kind === 'mpim' ? null : (channelName ?? null), label)
+  const fallback = kind === 'mpim'
+    ? `${senderName} shared a secret in this group conversation. Check your DMs.`
+    : `${senderName} shared a secret in #${channelName ?? 'this channel'}. Check your DMs.`
+
+  const result = await client.chat.postMessage({ channel: channelId, blocks, text: fallback })
+  if (result.ok && result.ts) {
+    // Keep the legacy single-announcement columns fresh too (harmless; the
+    // per-conversation table is now the source of truth for revoke/expiry).
+    await dbs.secrets.setChannelAnnouncementMessage(secretId, channelId, result.ts)
+    await dbs.channelAnnouncements.record(secretId, channelId, result.ts)
+  }
+}
+
 export async function handleModalSubmit(args: ModalSubmitArgs): Promise<void> {
   const { view, ack, body, client } = args
 
@@ -98,73 +130,76 @@ export async function handleModalSubmit(args: ModalSubmitArgs): Promise<void> {
   const mpimInput = ((values.mpim_block?.mpim_id as any)?.value ?? '').trim()
   const selectedMpimId: string | null = mpimInput ? extractChannelId(mpimInput) : null
 
-  // Exactly one of the three recipient modes may be set.
-  const modesSet = [selectedConv, selectedUserGroupId, selectedMpimId].filter(Boolean)
-  if (modesSet.length > 1) {
-    logger.warn({ selectedConv, selectedUserGroupId, selectedMpimId }, 'Multiple recipient modes selected')
-    await notifySender(
-      '⚠️ Please choose only one recipient type: a recipient (person/channel), a user group, OR a group conversation ID.',
-    )
-    return
+  // Each recipient slot is independently optional; one secret fans out to
+  // whichever are filled — a single target, any two, or all three at once.
+  let includeChannel = false // selectedConv resolves to a channel (C/G)
+  let includePerson = false // selectedConv resolves to a person (U/D)
+  let includeUserGroup = !!selectedUserGroupId
+  let includeMpim = !!selectedMpimId
+
+  if (selectedConv) {
+    if (selectedConv.startsWith('C') || selectedConv.startsWith('G')) includeChannel = true
+    else includePerson = true // U (user) or D (DM conversation)
   }
-  if (modesSet.length === 0) {
+
+  const anyTarget = () => includeChannel || includePerson || includeUserGroup || includeMpim
+  let targetCount = [includeChannel, includePerson, includeUserGroup, includeMpim].filter(Boolean).length
+  if (targetCount === 0) {
     logger.warn('Modal submitted without any recipient')
     await notifySender('⚠️ Please select a recipient, a user group, or a group conversation ID before sending.')
     return
   }
 
-  const isUserGroupRecipient = !!selectedUserGroupId
-  const isMpimRecipient = !!selectedMpimId
-  // Determine channel vs 1:1 only when not targeting a user group or group conversation.
-  const isChannelRecipient =
-    !isUserGroupRecipient && !isMpimRecipient && (selectedConv!.startsWith('C') || selectedConv!.startsWith('G'))
-
-  // Validate the group conversation EARLY, before any secret is created. The
-  // bot must be a member to enumerate members (conversations.members/info
-  // return channel_not_found otherwise), and it must actually be an mpim — a
-  // pasted id can be any conversation, so we don't trust the prefix (an mpim
-  // can carry a C prefix and is_private=true; only is_mpim is reliable).
-  if (isMpimRecipient) {
+  // Validate the group conversation EARLY (the bot must be a member to enumerate
+  // members, and only is_mpim is a reliable type signal — a pasted id can be any
+  // conversation). On failure, skip JUST the group-conversation target rather
+  // than aborting the whole submission, unless it was the only target.
+  if (includeMpim) {
     try {
       const info = await client.conversations.info({ channel: selectedMpimId! })
       if (!info.ok || !(info.channel as any)?.is_mpim) {
-        await notifySender(
-          '⚠️ That is not a group conversation (multi-person DM). Please share to a person, a channel, or a user group instead.',
-        )
-        return
+        await notifySender('⚠️ That is not a group conversation (multi-person DM); skipping it.')
+        includeMpim = false
       }
     } catch (err: any) {
       logger.warn({ err, selectedMpimId }, 'Could not access group conversation; likely bot is not a member')
-      await notifySender(
-        '⚠️ The bot could not access that group conversation. Please add @SecretBot to it first, then try again.',
-      )
-      return
+      await notifySender('⚠️ The bot could not access that group conversation; skipping it. Add @SecretBot to it first if you want it included.')
+      includeMpim = false
     }
+    if (!anyTarget()) return
   }
 
+  // Resolve the person recipient (1:1). On failure, skip just that target unless
+  // it was the only one.
   let channelRecipientId: string | null = null
   let dmUserId: string | null = null
 
-  if (isUserGroupRecipient || isMpimRecipient) {
-    // Delivery is handled by the fan-out worker; no per-recipient id resolved here.
-  } else if (isChannelRecipient) {
+  if (includeChannel) {
     channelRecipientId = selectedConv
-  } else {
-    // selectedConv is a DM conversation ID (D...) or User ID (U...)
+  }
+  if (includePerson) {
     if (selectedConv!.startsWith('U')) {
       dmUserId = selectedConv
     } else {
-      // D... DM conversation — resolve member
+      // D... DM conversation — resolve the other member.
       const convInfo = await client.conversations.info({ channel: selectedConv! })
       const members: string[] = (convInfo.channel as any)?.members || []
       dmUserId = members.find((m: string) => m !== senderId) ?? null
-      if (!dmUserId) {
-        logger.error({ selectedConv }, 'Could not resolve DM recipient')
-        await notifySender('⚠️ Could not resolve the recipient you selected. Please try again.')
-        return
-      }
+    }
+    if (!dmUserId) {
+      logger.warn({ selectedConv }, 'Could not resolve DM recipient')
+      await notifySender('⚠️ Could not resolve the recipient you selected; skipping them.')
+      includePerson = false
+      if (!anyTarget()) return
     }
   }
+
+  // Final surviving target set (some slots may have been skipped above).
+  targetCount = [includeChannel, includePerson, includeUserGroup, includeMpim].filter(Boolean).length
+  const isUserGroupRecipient = includeUserGroup
+  const isMpimRecipient = includeMpim
+  const isChannelRecipient = includeChannel
+  const isPersonRecipient = includePerson
 
   // Try to get the origin channel ID from various sources
   let originChannelId = (body as any).channel?.id || (body as any).container?.channel_id
@@ -185,21 +220,23 @@ export async function handleModalSubmit(args: ModalSubmitArgs): Promise<void> {
   try {
     const dbs = createDatabases(pool)
 
-    // Determine visibility mode and allowed viewer.
-    // - User group / group conversation (mpim): 'multi', allowedViewerId=null (fan-out to members)
-    // - Channel: 'multi', allowedViewerId=null
-    // - 1:1:     'single', allowedViewerId=dmUserId
-    const multiFanOut = isUserGroupRecipient || isChannelRecipient || isMpimRecipient
+    // Reveal is ungated ('multi') whenever there's fan-out to a channel/user
+    // group/group-conversation OR more than one recipient is targeted; a lone 1:1
+    // person stays 'single' (locked to that viewer).
+    const multiFanOut = targetCount > 1 || isUserGroupRecipient || isChannelRecipient || isMpimRecipient
     const visibilityMode: 'single' | 'multi' = multiFanOut ? 'multi' : 'single'
     const allowedViewerId = multiFanOut ? null : dmUserId
 
-    // Get sender name + a display label for the recipient (used on the
-    // sender's own placeholder). For a user group we show the group handle as
-    // plain "@handle" text — NOT a <!subteam^> mention, which would notify the
-    // whole group from the sender's private DM.
+    // Display label on the sender's own placeholder. A single target shows the
+    // concrete recipient (a person @mention, or the user group's plain "@handle" —
+    // never a <!subteam^> mention, which would notify the whole group from the
+    // sender's private DM). Multiple targets show a count instead.
     const senderName = `<@${senderId}>`
-    let recipientName: string | null = dmUserId ? `<@${dmUserId}>` : null
-    if (isUserGroupRecipient && selectedUserGroupId) {
+    let recipientName: string | null
+    if (targetCount > 1) {
+      recipientName = `${targetCount} recipients`
+    } else if (isUserGroupRecipient && selectedUserGroupId) {
+      recipientName = null
       try {
         const ug = await client.usergroups.list({ include_count: false })
         const g = (ug.usergroups as any[])?.find((x) => x.id === selectedUserGroupId)
@@ -207,6 +244,8 @@ export async function handleModalSubmit(args: ModalSubmitArgs): Promise<void> {
       } catch (err) {
         logger.warn({ err, selectedUserGroupId }, 'Could not resolve user group handle for display')
       }
+    } else {
+      recipientName = dmUserId ? `<@${dmUserId}>` : null
     }
 
     const secretType: 'text' | 'file' | 'combined' = hasText && hasFile ? 'combined' : hasFile ? 'file' : 'text'
@@ -315,10 +354,17 @@ export async function handleModalSubmit(args: ModalSubmitArgs): Promise<void> {
       logger.warn({ secretId: secret.id, senderId }, 'Could not open DM with sender for placeholder')
     }
 
-    // User Group recipient: expand the group and DM each member. There is NO
-    // channel announcement here - a user group has no channel to announce in.
+    // Deliver to each surviving target INDEPENDENTLY so one secret fans out to any
+    // combination of person / user group / group conversation / channel. A target
+    // that fails its own cap/access check is skipped with a note to the sender —
+    // it no longer aborts the whole submission. `deliveredAny` tracks whether
+    // anything went out; if nothing did, the secret is discarded below.
+    let deliveredAny = false
+    const botUid = await getBotUserId(client)
+
+    // User group — fan out to each member (no channel announcement: a user group
+    // has no channel to announce in).
     if (isUserGroupRecipient && selectedUserGroupId) {
-      // Cap check on how many members we would fan out to
       let groupMemberCount = 0
       try {
         const ugMembers = await client.usergroups.users.list({
@@ -326,165 +372,134 @@ export async function handleModalSubmit(args: ModalSubmitArgs): Promise<void> {
           include_disabled: false,
         })
         const ids = (ugMembers.users as string[]) ?? []
-        const botUid = await getBotUserId(client)
         groupMemberCount = ids.filter((m: string) => m !== senderId && m !== botUid).length
       } catch (err) {
         logger.warn({ err, selectedUserGroupId }, 'Could not resolve user group members for cap check')
       }
 
-      const config = getConfig()
       if (groupMemberCount > config.security.max_channel_members) {
         logger.warn({ groupMemberCount, cap: config.security.max_channel_members }, 'User group too large')
         await notifySender(
-          `⚠️ That user group has ${groupMemberCount} members, exceeding the cap of ${config.security.max_channel_members}. Secret not delivered.`,
+          `⚠️ That user group has ${groupMemberCount} members, exceeding the cap of ${config.security.max_channel_members}; it was skipped.`,
         )
-        await dbs.secrets.hardDeleteSecretsForId(secret.id)
-        return
+      } else {
+        await channelDeliveryQueue.add('deliver-usergroup-secret', {
+          secretId: secret.id,
+          recipientKind: 'usergroup',
+          recipientId: selectedUserGroupId,
+          senderId,
+        })
+        deliveredAny = true
+        logger.info(
+          { secretId: secret.id, selectedUserGroupId, groupMemberCount },
+          'User group secret delivery enqueued',
+        )
       }
+    }
 
-      // Enqueue async fan-out — do NOT loop here (ack window constraint)
-      await channelDeliveryQueue.add('deliver-usergroup-secret', {
-        secretId: secret.id,
-        recipientKind: 'usergroup',
-        recipientId: selectedUserGroupId,
-        senderId,
-      })
-
-      logger.info(
-        { secretId: secret.id, selectedUserGroupId, groupMemberCount },
-        'User group secret delivery enqueued',
-      )
-    } else if (isMpimRecipient && selectedMpimId) {
-      // Group conversation (mpim): fan out a per-member DM, plus an
-      // announcement in the conversation (the bot is a member to be here at
-      // all). The sender is a member too and is excluded from fan-out, so they
-      // only ever see their own control message.
-      const botUid = await getBotUserId(client)
+    // Group conversation (mpim) — per-member DM + an announcement in the
+    // conversation. Cap-checked before announcing so we never post an announcement
+    // for a delivery we then drop.
+    if (isMpimRecipient && selectedMpimId) {
       const mpimMemberIds = await resolveChannelMembers(client, selectedMpimId)
       const memberCount = mpimMemberIds.filter((m) => m !== senderId && m !== botUid).length
 
-      const config = getConfig()
       if (memberCount > config.security.max_channel_members) {
         logger.warn({ memberCount, cap: config.security.max_channel_members }, 'Group conversation too large')
         await notifySender(
-          `⚠️ That group conversation has ${memberCount} members, exceeding the cap of ${config.security.max_channel_members}. Secret not delivered.`,
+          `⚠️ That group conversation has ${memberCount} members, exceeding the cap of ${config.security.max_channel_members}; it was skipped.`,
         )
-        await dbs.secrets.hardDeleteSecretsForId(secret.id)
-        return
+      } else {
+        // An mpim's real name is an "mpdm-…" slug, so announce with the
+        // 'group conversation' label; the per-conversation table lets
+        // revoke/expiry update it in place.
+        await announceSecretInConversation(client, dbs, secret.id, senderId, selectedMpimId, 'mpim')
+        await channelDeliveryQueue.add('deliver-mpim-secret', {
+          secretId: secret.id,
+          recipientKind: 'mpim',
+          recipientId: selectedMpimId,
+          senderId,
+        })
+        deliveredAny = true
+        logger.info({ secretId: secret.id, selectedMpimId, memberCount }, 'Group conversation secret delivery enqueued')
       }
+    }
 
-      // Announcement into the group conversation. Reuse the channel-announcement
-      // tracking so revoke/expiry updates it in place. Pass channelName=null +
-      // label 'group conversation' (an mpim's real name is an "mpdm-…" slug).
-      const announcementBlocks = buildChannelAnnouncementBlocks(`<@${senderId}>`, null, 'group conversation')
-      const announcementResult = await client.chat.postMessage({
-        channel: selectedMpimId,
-        blocks: announcementBlocks,
-        text: `<@${senderId}> shared a secret in this group conversation. Check your DMs.`,
-      })
-      if (announcementResult.ok && announcementResult.ts) {
-        await dbs.secrets.setChannelAnnouncementMessage(secret.id, selectedMpimId, announcementResult.ts)
-      }
-
-      await channelDeliveryQueue.add('deliver-mpim-secret', {
-        secretId: secret.id,
-        recipientKind: 'mpim',
-        recipientId: selectedMpimId,
-        senderId,
-      })
-
-      logger.info({ secretId: secret.id, selectedMpimId, memberCount }, 'Group conversation secret delivery enqueued')
-    } else if (isChannelRecipient && channelRecipientId) {
-      // Resolve channel name for announcements
+    // Channel — bot joins a public channel if needed (private channels the bot
+    // isn't in are skipped, never force-joined), announces, then fans out.
+    if (isChannelRecipient && channelRecipientId) {
       const channelInfo = await client.conversations.info({ channel: channelRecipientId })
       const isMember = channelInfo.channel?.is_member
       const isPrivate = channelInfo.channel?.is_private
       const channelName = (channelInfo.channel as any)?.name ?? null
 
-      if (!isMember) {
-        if (!isPrivate) {
-          // Public channel — bot can self-join
+      const memberIds = await resolveChannelMembers(client, channelRecipientId)
+      const memberCount = memberIds.filter((m: string) => m !== senderId && m !== botUid).length
+
+      if (!isMember && isPrivate) {
+        logger.warn({ channelRecipientId }, 'Bot not in private channel, cannot deliver')
+        await notifySender(
+          `⚠️ The bot is not in the private channel <#${channelRecipientId}>; it was skipped. Invite @SecretBot to that channel first if you want it included.`,
+        )
+      } else if (memberCount > config.security.max_channel_members) {
+        logger.warn({ memberCount, cap: config.security.max_channel_members }, 'Channel too large')
+        await notifySender(
+          `⚠️ Channel has ${memberCount} members, exceeding the cap of ${config.security.max_channel_members}; it was skipped.`,
+        )
+      } else {
+        if (!isMember) {
           await client.conversations.join({ channel: channelRecipientId })
           logger.info({ channelRecipientId }, 'Bot joined public channel')
-        } else {
-          // Private channel — cannot auto-join, notify sender via their DM
-          logger.warn({ channelRecipientId }, 'Bot not in private channel, cannot deliver')
-          if (senderDmChannelId) {
-            await client.chat.postMessage({
-              channel: senderDmChannelId,
-              text: `⚠️ The bot is not in the private channel <#${channelRecipientId}>. Please invite @SecretBot to that channel first, then try again.`,
-            })
-          }
-          await dbs.secrets.hardDeleteSecretsForId(secret.id)
-          return
         }
+        await announceSecretInConversation(client, dbs, secret.id, senderId, channelRecipientId, 'channel', channelName)
+
+        await channelDeliveryQueue.add('deliver-channel-secret', {
+          secretId: secret.id,
+          channelId: channelRecipientId,
+          senderId,
+        })
+        deliveredAny = true
+        logger.info({ secretId: secret.id, channelRecipientId }, 'Channel secret delivery enqueued')
       }
+    }
 
-      // Post channel announcement (visible to all members)
-      const announcementBlocks = buildChannelAnnouncementBlocks(`<@${senderId}>`, channelName)
-      const announcementResult = await client.chat.postMessage({
-        channel: channelRecipientId,
-        blocks: announcementBlocks,
-        text: `<@${senderId}> shared a secret in #${channelName ?? 'this channel'}. Check your DMs.`,
-      })
-
-      if (announcementResult.ok && announcementResult.ts) {
-        await dbs.secrets.setChannelAnnouncementMessage(
+    // 1:1 person — recipient gets their own View Secret DM.
+    if (isPersonRecipient && dmUserId) {
+      const dmResult = await client.conversations.open({ users: dmUserId })
+      const dmChannelId = dmResult.channel?.id
+      if (dmChannelId) {
+        const recipientPlaceholderBlocks = buildRecipientPlaceholderBlocks(
+          secretType,
+          senderName,
+          `<@${dmUserId}>`,
           secret.id,
-          channelRecipientId,
-          announcementResult.ts,
         )
-      }
-
-      // Check member count against cap before enqueuing
-      const memberIds = await resolveChannelMembers(client, channelRecipientId)
-      const config = getConfig()
-      const botUid = await getBotUserId(client)
-      const memberCount = memberIds.filter((m: string) => m !== senderId && m !== botUid).length
-      if (memberCount > config.security.max_channel_members) {
-        logger.warn({ memberCount, cap: config.security.max_channel_members }, 'Channel too large')
-        if (senderDmChannelId) {
-          await client.chat.postMessage({
-            channel: senderDmChannelId,
-            text: `⚠️ Channel has ${memberCount} members, exceeding the cap of ${config.security.max_channel_members}. Secret not delivered.`,
-          })
-        }
-        await dbs.secrets.hardDeleteSecretsForId(secret.id)
-        return
-      }
-
-      // Enqueue async delivery — do NOT loop here (ack window constraint)
-      await channelDeliveryQueue.add('deliver-channel-secret', {
-        secretId: secret.id,
-        channelId: channelRecipientId,
-        senderId,
-      })
-
-      logger.info({ secretId: secret.id, channelRecipientId }, 'Channel secret delivery enqueued')
-    } else {
-      // 1:1 DM secret — recipient gets their View Secret DM (unchanged)
-      if (dmUserId) {
-        const dmResult = await client.conversations.open({ users: dmUserId })
-        const dmChannelId = dmResult.channel?.id
-        if (dmChannelId) {
-          const recipientPlaceholderBlocks = buildRecipientPlaceholderBlocks(secretType, senderName, recipientName, secret.id)
-
-          const dmPostResult = await client.chat.postMessage({
-            channel: dmChannelId,
-            blocks: recipientPlaceholderBlocks,
-            text: `Secret from ${senderName}`,
-          })
-
-          if (dmPostResult.ok) {
-            logger.info({ secretId: secret.id, dmChannelId }, 'Recipient DM posted')
-            await dbs.secrets.setRecipientDmMessage(secret.id, dmChannelId, dmPostResult.ts!)
-          } else {
-            logger.error({ err: dmPostResult.error }, 'Failed to post recipient DM')
-          }
+        const dmPostResult = await client.chat.postMessage({
+          channel: dmChannelId,
+          blocks: recipientPlaceholderBlocks,
+          text: `Secret from ${senderName}`,
+        })
+        if (dmPostResult.ok) {
+          deliveredAny = true
+          // Explicit reveal grant for a person inside a combined (multi) secret;
+          // harmless no-op that also covers the lone single-mode case.
+          await dbs.allowedViewers.create(secret.id, dmUserId)
+          await dbs.secrets.setRecipientDmMessage(secret.id, dmChannelId, dmPostResult.ts!)
+          logger.info({ secretId: secret.id, dmChannelId }, 'Recipient DM posted')
         } else {
-          logger.warn({ recipientId: dmUserId }, 'Failed to open DM channel')
+          logger.error({ err: dmPostResult.error }, 'Failed to post recipient DM')
         }
+      } else {
+        logger.warn({ recipientId: dmUserId }, 'Failed to open DM channel')
       }
+    }
+
+    // Nothing reached anyone (every target failed its own check) — don't leave a
+    // dangling secret behind.
+    if (!deliveredAny) {
+      logger.warn({ secretId: secret.id }, 'No recipient could be delivered to; discarding secret')
+      await dbs.secrets.hardDeleteSecretsForId(secret.id)
+      await notifySender('⚠️ The secret could not be delivered to any of the selected recipients.')
     }
   } catch (err: any) {
     logger.error({ err, errMessage: err.message, errStack: err.stack }, 'Error processing modal submission')
@@ -545,14 +560,7 @@ export async function handleShareSubmit(args: ModalSubmitArgs): Promise<void> {
     const mpimInput = ((values.mpim_block?.mpim_id as any)?.value ?? '').trim()
     const selectedMpimId: string | null = mpimInput ? extractChannelId(mpimInput) : null
 
-    const modesSet = [selectedConv, selectedUserGroupId, selectedMpimId].filter(Boolean)
-    if (modesSet.length > 1) {
-      await notifySender(
-        '⚠️ Please choose only one recipient type: a recipient (person/channel), a user group, OR a group conversation ID.',
-      )
-      return
-    }
-    if (modesSet.length === 0) {
+    if ([selectedConv, selectedUserGroupId, selectedMpimId].filter(Boolean).length === 0) {
       await notifySender('⚠️ Please select a recipient, a user group, or a group conversation ID before forwarding.')
       return
     }
@@ -560,7 +568,8 @@ export async function handleShareSubmit(args: ModalSubmitArgs): Promise<void> {
     const config = getConfig()
     const botUid = await getBotUserId(client)
 
-    // Enqueue a fan-out job and confirm to the sender. `noun` is display-only.
+    // Enqueue a fan-out job for one entity and confirm to the sender. `noun` is
+    // display-only. Each entity forwarded to is confirmed independently.
     async function fanOut(payload: {
       recipientKind: 'channel' | 'usergroup' | 'mpim'
       recipientId: string
@@ -576,6 +585,11 @@ export async function handleShareSubmit(args: ModalSubmitArgs): Promise<void> {
       await notifySender(`🔗 Forwarded to ${payload.noun}. Each person gets their own one-time View Secret DM.`)
     }
 
+    // Every filled slot is forwarded independently: any single target, any two, or
+    // all three. A target failing its own cap/access check is skipped with a note
+    // while the rest still go out. The worker de-duplicates anyone reached through
+    // more than one entity and reports them to the sender.
+
     // 1) User Group → expand + DM each member (works without bot membership).
     if (selectedUserGroupId) {
       let count = 0
@@ -587,12 +601,11 @@ export async function handleShareSubmit(args: ModalSubmitArgs): Promise<void> {
       }
       if (count > config.security.max_channel_members) {
         await notifySender(
-          `⚠️ That user group has ${count} members, exceeding the cap of ${config.security.max_channel_members}. Not forwarded.`,
+          `⚠️ That user group has ${count} members, exceeding the cap of ${config.security.max_channel_members}; it was skipped.`,
         )
-        return
+      } else {
+        await fanOut({ recipientKind: 'usergroup', recipientId: selectedUserGroupId, noun: `the user group (${count})` })
       }
-      await fanOut({ recipientKind: 'usergroup', recipientId: selectedUserGroupId, noun: `the user group (${count})` })
-      return
     }
 
     // 2) Group Conversation ID field → must be an mpim the bot is a member of.
@@ -600,76 +613,79 @@ export async function handleShareSubmit(args: ModalSubmitArgs): Promise<void> {
       try {
         const info = await client.conversations.info({ channel: selectedMpimId })
         if (!info.ok || !(info.channel as any)?.is_mpim) {
-          await notifySender('⚠️ That is not a group conversation (multi-person DM). Forward to a person, a channel, or a user group instead.')
-          return
+          await notifySender('⚠️ That is not a group conversation (multi-person DM); skipping it.')
+        } else {
+          await announceSecretInConversation(client, dbs, secretId, senderId, selectedMpimId, 'mpim')
+          await fanOut({ recipientKind: 'mpim', recipientId: selectedMpimId, noun: 'the group conversation' })
         }
       } catch (err: any) {
         logger.warn({ err, selectedMpimId }, 'Could not access group conversation for forward; bot likely not a member')
-        await notifySender('⚠️ The bot could not access that group conversation. Please add @SecretBot to it first, then try again.')
-        return
+        await notifySender('⚠️ The bot could not access that group conversation; skipping it. Add @SecretBot to it first if you want it included.')
       }
-      await fanOut({ recipientKind: 'mpim', recipientId: selectedMpimId, noun: 'the group conversation' })
-      return
     }
 
-    // 3) conversations_select value: C/G = channel fan-out, U = person, D = resolve DM.
-    if (selectedConv!.startsWith('C') || selectedConv!.startsWith('G')) {
+    // 3) conversations_select value: C/G = channel fan-out (channel or mpim).
+    if (selectedConv && (selectedConv.startsWith('C') || selectedConv.startsWith('G'))) {
       let isMpim = false
+      let channelName: string | null = null
+      let accessible = true
       try {
-        const info = await client.conversations.info({ channel: selectedConv! })
+        const info = await client.conversations.info({ channel: selectedConv })
         if (!info.ok || !info.channel?.is_member) {
-          await notifySender(`⚠️ The bot is not in <#${selectedConv}>. Please invite @SecretBot to that conversation first, then try again.`)
-          return
+          await notifySender(`⚠️ The bot is not in <#${selectedConv}>; skipping it. Invite @SecretBot to that conversation first if you want it included.`)
+          accessible = false
+        } else {
+          isMpim = !!(info.channel as any).is_mpim
+          channelName = (info.channel as any)?.name ?? null
         }
-        isMpim = !!(info.channel as any).is_mpim
       } catch (err: any) {
         logger.warn({ err, selectedConv }, 'Could not access conversation for forward; bot likely not a member')
-        await notifySender('⚠️ The bot could not access that conversation. Please add @SecretBot to it first, then try again.')
-        return
+        await notifySender('⚠️ The bot could not access that conversation; skipping it. Add @SecretBot to it first if you want it included.')
+        accessible = false
       }
-      const memberIds = await resolveChannelMembers(client, selectedConv!)
-      const memberCount = memberIds.filter((m) => m !== senderId && m !== botUid).length
-      if (memberCount > config.security.max_channel_members) {
-        await notifySender(
-          `⚠️ That conversation has ${memberCount} members, exceeding the cap of ${config.security.max_channel_members}. Not forwarded.`,
-        )
-        return
+      if (accessible) {
+        const memberIds = await resolveChannelMembers(client, selectedConv)
+        const memberCount = memberIds.filter((m) => m !== senderId && m !== botUid).length
+        if (memberCount > config.security.max_channel_members) {
+          await notifySender(
+            `⚠️ That conversation has ${memberCount} members, exceeding the cap of ${config.security.max_channel_members}; it was skipped.`,
+          )
+        } else {
+          await announceSecretInConversation(client, dbs, secretId, senderId, selectedConv, isMpim ? 'mpim' : 'channel', isMpim ? null : channelName)
+          await fanOut({
+            recipientKind: isMpim ? 'mpim' : 'channel',
+            recipientId: selectedConv,
+            noun: isMpim ? 'the group conversation' : `the channel (${memberCount})`,
+          })
+        }
       }
-      // No announcement on a forward — the secret already has one wherever it was
-      // first shared; this only adds new recipient DMs.
-      await fanOut({
-        recipientKind: isMpim ? 'mpim' : 'channel',
-        recipientId: selectedConv!,
-        noun: isMpim ? 'the group conversation' : `the channel (${memberCount})`,
-      })
-      return
     }
 
-    // Person (U... direct, or D... DM conversation to resolve).
-    let personId: string | null = null
-    if (selectedConv!.startsWith('U')) {
-      personId = selectedConv
-    } else {
-      const convInfo = await client.conversations.info({ channel: selectedConv! })
-      const members: string[] = (convInfo.channel as any)?.members || []
-      personId = members.find((m: string) => m !== senderId) ?? null
+    // Person (U... direct, or D... DM conversation to resolve) via the select.
+    if (selectedConv && (selectedConv.startsWith('U') || selectedConv.startsWith('D'))) {
+      let personId: string | null = null
+      if (selectedConv.startsWith('U')) {
+        personId = selectedConv
+      } else {
+        const convInfo = await client.conversations.info({ channel: selectedConv })
+        const members: string[] = (convInfo.channel as any)?.members || []
+        personId = members.find((m: string) => m !== senderId) ?? null
+      }
+      if (!personId) {
+        await notifySender('⚠️ Could not resolve the recipient you selected; skipping them.')
+      } else if (personId === senderId) {
+        await notifySender('⚠️ You cannot forward a secret to yourself — you already have it.')
+      } else {
+        await channelDeliveryQueue.add('forward-user-secret', {
+          secretId,
+          recipientKind: 'users',
+          recipientIds: [personId],
+          senderId,
+        })
+        logger.info({ secretId, personId }, 'Forward to person enqueued')
+        await notifySender('🔗 Forwarded. They got their own one-time View Secret DM.')
+      }
     }
-    if (!personId) {
-      await notifySender('⚠️ Could not resolve the recipient you selected. Please try again.')
-      return
-    }
-    if (personId === senderId) {
-      await notifySender('⚠️ You cannot forward a secret to yourself — you already have it.')
-      return
-    }
-    await channelDeliveryQueue.add('forward-user-secret', {
-      secretId,
-      recipientKind: 'users',
-      recipientIds: [personId],
-      senderId,
-    })
-    logger.info({ secretId, personId }, 'Forward to person enqueued')
-    await notifySender('🔗 Forwarded. They got their own one-time View Secret DM.')
   } catch (err: any) {
     logger.error({ err, errMessage: err.message }, 'Error processing forward (share) submission')
   }

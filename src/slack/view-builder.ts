@@ -233,13 +233,16 @@ export function buildPlaceholderBlocks(secretType: SecretType, senderName: strin
   ]
 }
 
-export function buildRecipientPlaceholderBlocks(secretType: SecretType, senderName: string, recipientName?: string | null, secretId?: string) {
+export function buildRecipientPlaceholderBlocks(secretType: SecretType, senderName: string, recipientName?: string | null, secretId?: string, entityLabel?: string | null) {
   const { emoji, typeLabel } = describeSecretType(secretType)
 
-  // For recipient: show only View Secret button
+  // For recipient: show only View Secret button. When the secret reached the
+  // recipient through an entity (a channel / user group / group conversation),
+  // name that entity so they know where it came from.
+  const viaText = entityLabel ? ` via ${entityLabel}` : ''
   const headerText = recipientName
-    ? `${emoji} *${senderName} shared a ${typeLabel.toLowerCase()} with you*\nClick View Secret to open.`
-    : `${emoji} *${typeLabel} from ${senderName}*\nClick View Secret to open.`
+    ? `${emoji} *${senderName} shared a ${typeLabel.toLowerCase()} with you${viaText}*\nClick View Secret to open.`
+    : `${emoji} *${typeLabel} from ${senderName}${viaText}*\nClick View Secret to open.`
 
   return [
     {
