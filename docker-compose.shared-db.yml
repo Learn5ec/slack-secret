@@ -1,0 +1,29 @@
+# Overlay for the case where Postgres runs as a container on an EXTERNAL Docker
+# network (a centralized / shared DB you do NOT own or start here).
+#
+# The base docker-compose.yml deliberately ships no Postgres service. If your
+# Postgres is reachable by hostname (managed service, host.docker.internal, or
+# another compose project), you don't need this file at all — just point
+# POSTGRES_HOST at it in `.env`.
+#
+# Use this overlay ONLY when the shared Postgres lives on a pre-existing Docker
+# network. The network is supplied via ${POSTGRES_NETWORK} — nothing vendor-
+# specific is hardcoded here.
+#
+#   POSTGRES_NETWORK=my_shared_db_net POSTGRES_HOST=<db-container-name> docker compose \
+#     -f docker-compose.yml -f docker-compose.shared-db.yml up -d
+#
+# In `.env` set POSTGRES_HOST to the DB container's name/alias on that network.
+
+services:
+  bot:
+    networks:
+      - slack_secret_net
+      - postgres_shared_net
+
+networks:
+  # Attach the bot to the already-existing shared-DB network. `external: true`
+  # means compose will NOT try to create it — it must exist beforehand.
+  postgres_shared_net:
+    name: ${POSTGRES_NETWORK:?set POSTGRES_NETWORK to the existing shared DB network}
+    external: true

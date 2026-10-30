@@ -180,6 +180,32 @@ npm run dev
 You'll still need to create `.env` yourself (see `.env.example`) and have PostgreSQL/Redis
 already running and reachable.
 
+**Setup** (Docker):
+
+The bot connects to an **external / centralized Postgres** — `docker-compose.yml` deliberately
+ships no Postgres service, so you don't run a throwaway DB per deployment. Redis is the only
+backing service the bot owns. All Postgres settings come from `.env`; nothing environment-
+specific is baked into the compose files.
+
+```bash
+cp .env.example .env      # set POSTGRES_* to your shared DB, plus Slack tokens
+docker compose up -d --build
+```
+
+The entrypoint generates the master key on first boot (persisted via a bind mount), copies
+config/migrations into the compiled output, applies migrations against the external Postgres,
+then starts the bot. The health endpoint is bound to loopback only (`127.0.0.1:${HEALTH_PORT}`).
+
+If your shared Postgres runs as a container on a **pre-existing external Docker network** rather
+than a plain hostname, add the overlay and point the bot at it — nothing vendor-specific is
+hardcoded, the network name is supplied via `${POSTGRES_NETWORK}`:
+
+```bash
+# .env: POSTGRES_HOST=<db-container-name>, POSTGRES_NETWORK=<existing-network>
+POSTGRES_NETWORK=<existing-network> docker compose \
+  -f docker-compose.yml -f docker-compose.shared-db.yml up -d --build
+```
+
 **Required Slack bot token scopes**: `commands`, `chat:write`, `chat:write.public`, `im:write`,
 `files:write`, `channels:read`, `groups:read`, `files:read`, `users:read`. Channel sharing on this
 branch needs no extra scopes — it reuses the ones above to enumerate members and post the

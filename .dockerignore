@@ -1,0 +1,23 @@
+# Don't ship local-only or build-regenerated artifacts into the build context.
+node_modules
+dist
+.env
+.env.local
+*.log
+logs
+encrypted-storage
+src/crypto/keys
+*.key
+*.key.age
+.claude
+graphify
+graphify-out
+bug-tracker.csv
+devops-data
+*.md
+!README.md
+Dockerfile
+docker-compose*.yml
+.dockerignore
+.git
+.gitignore
