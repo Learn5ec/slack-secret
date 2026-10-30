@@ -2,6 +2,24 @@
 
 A Slack bot that lets users share text, files, or both privately with per-viewer view-once, instant-hide, and auto-delete behavior.
 
+## 📌 Which branch should I use?
+
+Secret Bot ships in three cumulative tiers, one per branch — each includes everything in the tier
+below it, plus the same encryption / view-once / auto-delete / revoke behavior described below. **You
+are on the peer-to-peer tier.**
+
+| Branch | Can share to | Use it when… |
+| --- | --- | --- |
+| **`main`** ← *you are here* | One person (1:1 DM) | You only need peer-to-peer secret sharing. |
+| `feat-multi-secret` | + Slack channels (public & private, DMs each member) | You also need channel-wide sharing. |
+| `feat-share-and-group-support` | + User Groups, Group Conversations (private group DMs), forwarding an already-shared secret, and per-recipient access management | You want every recipient type and the most control. |
+
+To clone a specific tier:
+
+```bash
+git clone --branch <branch> https://github.com/Learn5ec/slack-secret.git
+```
+
 ## 🚀 Features
 
 ### Core Functionality
@@ -12,6 +30,11 @@ A Slack bot that lets users share text, files, or both privately with per-viewer
 - **Combined Secrets**: Text and a file together in one share
 - **Single Viewer Mode**: Send secrets to one specific user via DM
 - **Multi Viewer Mode**: Share with anyone who clicks (no recipient specified)
+
+> This branch is **peer-to-peer only** — a secret goes to one person (or, in multi-viewer mode,
+> whoever holds the View button). Channel sharing, User Groups, group conversations, forwarding, and
+> per-recipient access control are **not** here; pick `feat-multi-secret` or
+> `feat-share-and-group-support` above for those.
 
 ### Encryption & Security
 
