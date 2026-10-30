@@ -1,4 +1,25 @@
-export function buildSecretModal() {
+export type UserGroupOption = { id: string; handle: string; name: string; user_count?: number }
+
+// Slack caps a static_select at 100 options and each plain_text field at 75 chars.
+const MAX_STATIC_OPTIONS = 100
+function truncate(s: string, n: number): string {
+  return s.length > n ? s.slice(0, n - 1) + '…' : s
+}
+
+export function buildSecretModal(userGroups: UserGroupOption[] = []) {
+  const groupOptions = userGroups.length === 0
+    ? [{ text: { type: 'plain_text' as const, text: 'No user groups available' }, value: '' }]
+    : userGroups.slice(0, MAX_STATIC_OPTIONS).map((g) => ({
+        text: {
+          type: 'plain_text' as const,
+          text: truncate(
+            `${g.name} (@${g.handle}${typeof g.user_count === 'number' ? ` · ${g.user_count}` : ''})`,
+            75,
+          ),
+        },
+        value: g.id,
+      }))
+
   return {
     type: 'modal',
     callback_id: 'secret_modal',
@@ -39,6 +60,29 @@ export function buildSecretModal() {
           text: 'Recipient',
           emoji: true,
         },
+        // Optional so a secret can target a User Group alone. The modal
+        // handler enforces that at least one of Recipient / User Group is set.
+        optional: true,
+      },
+      {
+        type: 'input',
+        block_id: 'usergroup_block',
+        element: {
+          type: 'static_select',
+          placeholder: {
+            type: 'plain_text',
+            text: 'Select a user group',
+            emoji: true,
+          },
+          action_id: 'usergroup',
+          options: groupOptions,
+        },
+        label: {
+          type: 'plain_text',
+          text: 'User Group (optional)',
+          emoji: true,
+        },
+        optional: true,
       },
       {
         type: 'input',

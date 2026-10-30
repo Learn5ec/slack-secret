@@ -1,5 +1,26 @@
 import { logger } from '../utils/logger'
-import { buildSecretModal } from '../slack/view-builder'
+import { buildSecretModal, UserGroupOption } from '../slack/view-builder'
+
+// Fetch the workspace's selectable User Groups for the modal picker.
+// Returns [] on any failure (e.g. free plan / no usergroups:read) so the
+// modal still opens — the group picker just shows "No user groups available".
+async function fetchUserGroups(client: any): Promise<UserGroupOption[]> {
+  try {
+    const result = await client.usergroups.list({ include_count: true, include_disabled: false })
+    if (!result.ok || !Array.isArray(result.usergroups)) return []
+    return result.usergroups
+      .filter((g: any) => g && !g.deleted_by && g.is_visible !== false && !g.is_section && !g.is_idp_group)
+      .map((g: any) => ({
+        id: g.id as string,
+        handle: (g.handle as string) ?? (g.name as string),
+        name: (g.name as string) ?? (g.handle as string),
+        user_count: typeof g.user_count === 'number' ? g.user_count : undefined,
+      }))
+  } catch (err: any) {
+    logger.warn({ err, message: err.message }, 'Failed to fetch user groups for modal; continuing without group picker')
+    return []
+  }
+}
 
 type CommandArgs = {
   command: {
@@ -22,9 +43,10 @@ export async function handleSecretCommand(args: CommandArgs): Promise<void> {
   // Log for debugging
   logger.info({ trigger_id: command.trigger_id, has_client: !!client }, 'Attempting to open modal')
 
-  // Open the modal using views.open
-  const modalView = buildSecretModal()
-  logger.info({ modalView }, 'Built modal view')
+  // Fetch selectable User Groups (best-effort) and build the modal.
+  const userGroups = await fetchUserGroups(client)
+  const modalView = buildSecretModal(userGroups)
+  logger.info({ groupCount: userGroups.length }, 'Built modal view')
 
   try {
     const result = await client.views.open({

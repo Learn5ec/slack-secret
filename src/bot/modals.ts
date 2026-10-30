@@ -73,40 +73,61 @@ export async function handleModalSubmit(args: ModalSubmitArgs): Promise<void> {
   const secretText = hasText ? textValue : null
   const senderId = body.user.id
 
+  // Best-effort sender DM used for validation/delivery warnings.
+  async function notifySender(text: string): Promise<void> {
+    try {
+      const dm = await client.conversations.open({ users: senderId })
+      if (dm.channel?.id) await client.chat.postMessage({ channel: dm.channel.id, text })
+    } catch (err: any) {
+      logger.warn({ err, senderId }, 'Failed to DM sender during modal submit')
+    }
+  }
+
   // Try to get recipient from modal state.
   // conversations_select returns selected_conversation as a plain string ID:
   // C... = public channel, G... = private channel/group, D... = DM, U... = user.
   const selectedConv: string | null =
     (values.recipient_block?.recipient as any)?.selected_conversation ?? null
 
-  if (!selectedConv) {
-    logger.warn('Modal submitted without recipient')
+  // Optional User Group picker (static_select) -> { selected_option: { value: 'S...' } }
+  const selectedUserGroupId: string | null =
+    (values.usergroup_block?.usergroup as any)?.selected_option?.value ?? null
+
+  if (selectedUserGroupId && selectedConv) {
+    logger.warn({ selectedUserGroupId, selectedConv }, 'Both recipient and user group selected')
+    await notifySender('⚠️ Please choose either a recipient (person/channel) OR a user group, not both.')
+    return
+  }
+  if (!selectedUserGroupId && !selectedConv) {
+    logger.warn('Modal submitted without recipient or user group')
+    await notifySender('⚠️ Please select a recipient or a user group before sending.')
     return
   }
 
-  // Determine type by ID prefix
+  const isUserGroupRecipient = !!selectedUserGroupId
+  // Determine channel vs 1:1 only when not targeting a user group.
   const isChannelRecipient =
-    selectedConv.startsWith('C') || selectedConv.startsWith('G')
+    !isUserGroupRecipient && (selectedConv!.startsWith('C') || selectedConv!.startsWith('G'))
 
   let channelRecipientId: string | null = null
   let dmUserId: string | null = null
-  let visibilityMode: 'single' | 'multi'
 
-  if (isChannelRecipient) {
-    visibilityMode = 'multi'
+  if (isUserGroupRecipient) {
+    // Delivery is handled by the fan-out worker; no per-recipient id resolved here.
+  } else if (isChannelRecipient) {
     channelRecipientId = selectedConv
   } else {
-    visibilityMode = 'single'
     // selectedConv is a DM conversation ID (D...) or User ID (U...)
-    if (selectedConv.startsWith('U')) {
+    if (selectedConv!.startsWith('U')) {
       dmUserId = selectedConv
     } else {
       // D... DM conversation — resolve member
-      const convInfo = await client.conversations.info({ channel: selectedConv })
+      const convInfo = await client.conversations.info({ channel: selectedConv! })
       const members: string[] = (convInfo.channel as any)?.members || []
       dmUserId = members.find((m: string) => m !== senderId) ?? null
       if (!dmUserId) {
         logger.error({ selectedConv }, 'Could not resolve DM recipient')
+        await notifySender('⚠️ Could not resolve the recipient you selected. Please try again.')
         return
       }
     }
@@ -131,15 +152,29 @@ export async function handleModalSubmit(args: ModalSubmitArgs): Promise<void> {
   try {
     const dbs = createDatabases(pool)
 
-    // Determine visibility mode and allowed viewer
-    // For channel secrets: visibility_mode='multi', allowedViewerId=null
-    // For 1:1: visibility_mode='single', allowedViewerId=dmUserId
-    const visibilityMode = isChannelRecipient ? 'multi' : 'single'
-    const allowedViewerId = isChannelRecipient ? null : dmUserId
+    // Determine visibility mode and allowed viewer.
+    // - User group: 'multi', allowedViewerId=null (fan-out to members)
+    // - Channel:    'multi', allowedViewerId=null
+    // - 1:1:        'single', allowedViewerId=dmUserId
+    const visibilityMode: 'single' | 'multi' =
+      isUserGroupRecipient || isChannelRecipient ? 'multi' : 'single'
+    const allowedViewerId = isUserGroupRecipient || isChannelRecipient ? null : dmUserId
 
-    // Get sender name
+    // Get sender name + a display label for the recipient (used on the
+    // sender's own placeholder). For a user group we show the group handle as
+    // plain "@handle" text — NOT a <!subteam^> mention, which would notify the
+    // whole group from the sender's private DM.
     const senderName = `<@${senderId}>`
-    const recipientName = dmUserId ? `<@${dmUserId}>` : null
+    let recipientName: string | null = dmUserId ? `<@${dmUserId}>` : null
+    if (isUserGroupRecipient && selectedUserGroupId) {
+      try {
+        const ug = await client.usergroups.list({ include_count: false })
+        const g = (ug.usergroups as any[])?.find((x) => x.id === selectedUserGroupId)
+        recipientName = g ? `@${g.handle ?? g.name}` : null
+      } catch (err) {
+        logger.warn({ err, selectedUserGroupId }, 'Could not resolve user group handle for display')
+      }
+    }
 
     const secretType: 'text' | 'file' | 'combined' = hasText && hasFile ? 'combined' : hasFile ? 'file' : 'text'
     const masterKey = await getMasterKey()
@@ -247,8 +282,46 @@ export async function handleModalSubmit(args: ModalSubmitArgs): Promise<void> {
       logger.warn({ secretId: secret.id, senderId }, 'Could not open DM with sender for placeholder')
     }
 
-    // Channel recipient: post announcement + async delivery
-    if (isChannelRecipient && channelRecipientId) {
+    // User Group recipient: expand the group and DM each member. There is NO
+    // channel announcement here - a user group has no channel to announce in.
+    if (isUserGroupRecipient && selectedUserGroupId) {
+      // Cap check on how many members we would fan out to
+      let groupMemberCount = 0
+      try {
+        const ugMembers = await client.usergroups.users.list({
+          usergroup: selectedUserGroupId,
+          include_disabled: false,
+        })
+        const ids = (ugMembers.users as string[]) ?? []
+        const botUid = await getBotUserId(client)
+        groupMemberCount = ids.filter((m: string) => m !== senderId && m !== botUid).length
+      } catch (err) {
+        logger.warn({ err, selectedUserGroupId }, 'Could not resolve user group members for cap check')
+      }
+
+      const config = getConfig()
+      if (groupMemberCount > config.security.max_channel_members) {
+        logger.warn({ groupMemberCount, cap: config.security.max_channel_members }, 'User group too large')
+        await notifySender(
+          `⚠️ That user group has ${groupMemberCount} members, exceeding the cap of ${config.security.max_channel_members}. Secret not delivered.`,
+        )
+        await dbs.secrets.hardDeleteSecretsForId(secret.id)
+        return
+      }
+
+      // Enqueue async fan-out — do NOT loop here (ack window constraint)
+      await channelDeliveryQueue.add('deliver-usergroup-secret', {
+        secretId: secret.id,
+        recipientKind: 'usergroup',
+        recipientId: selectedUserGroupId,
+        senderId,
+      })
+
+      logger.info(
+        { secretId: secret.id, selectedUserGroupId, groupMemberCount },
+        'User group secret delivery enqueued',
+      )
+    } else if (isChannelRecipient && channelRecipientId) {
       // Resolve channel name for announcements
       const channelInfo = await client.conversations.info({ channel: channelRecipientId })
       const isMember = channelInfo.channel?.is_member
