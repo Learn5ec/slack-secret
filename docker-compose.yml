@@ -1,0 +1,71 @@
+# Slack Secret Bot — containerized deployment.
+#
+# DATABASE MODEL: the bot connects to an EXTERNAL Postgres. There is deliberately
+# NO Postgres service defined here — a centralized/shared Postgres is expected.
+# All Postgres settings come from `.env` (POSTGRES_HOST / POSTGRES_PORT /
+# POSTGRES_DB / POSTGRES_USER / POSTGRES_PASSWORD); nothing vendor-specific is
+# hardcoded here. Set POSTGRES_HOST to any reachable hostname (a managed DB,
+# host.docker.internal, or a container on a shared network — see
+# docker-compose.shared-db.yml for that last case).
+#
+# Redis is the only backing service this bot owns.
+
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: slack-secret-redis
+    restart: always
+    ports:
+      - "127.0.0.1:6380:6379"
+    volumes:
+      - slack_secret_redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - slack_secret_net
+
+  bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: slack-secret-bot
+    restart: always
+    depends_on:
+      redis:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      # Reach Redis over the compose network (overrides any host URL in .env).
+      REDIS_URL: redis://redis:6379
+      MASTER_KEY_FILE: /app/src/crypto/keys/master.key
+      STORAGE_DIR: /app/encrypted-storage
+    ports:
+      # Health endpoint, bound to loopback only.
+      - "127.0.0.1:${HEALTH_PORT:-9090}:${HEALTH_PORT:-9090}"
+    volumes:
+      - ./src/crypto/keys:/app/src/crypto/keys
+      - ./encrypted-storage:/app/encrypted-storage
+      - ./logs:/app/logs
+      - ./config:/app/config
+      # Host ClamAV signature DB, read-only, so the container needs no downloads.
+      - /var/lib/clamav:/var/lib/clamav:ro
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:${HEALTH_PORT:-9090}/healthz"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    networks:
+      - slack_secret_net
+
+volumes:
+  slack_secret_redis_data:
+    name: slack_secret_redis_data
+
+networks:
+  slack_secret_net:
+    name: slack_secret_net

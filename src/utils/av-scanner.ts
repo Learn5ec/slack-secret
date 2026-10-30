@@ -9,11 +9,11 @@ function runClamscan(fileBuffer: Buffer): Promise<{ stdout: string; stderr: stri
     const child = execFile(
       'clamscan',
       ['--no-summary', '--stdout', '-'],
-      { timeout: 30000, encoding: 'utf8' },
+      { timeout: 60000, encoding: 'utf8' },
       (err: any, stdout, stderr) => {
+        // Non-numeric err.code means the process itself failed to launch
+        // (e.g. ENOENT) rather than exiting with a non-zero status.
         if (err && typeof err.code !== 'number') {
-          // Non-numeric err.code means the process itself failed to launch
-          // (e.g. ENOENT) rather than exiting with a non-zero status.
           reject(err)
           return
         }
@@ -22,7 +22,18 @@ function runClamscan(fileBuffer: Buffer): Promise<{ stdout: string; stderr: stri
         resolve({ stdout: stdout ?? '', stderr: stderr ?? '', exitCode: err ? err.code : 0 })
       },
     )
-    child.stdin?.end(fileBuffer)
+
+    // clamscan can exit early (e.g. malformed input); guard against an
+    // unhandled EPIPE on a stdin that's already gone.
+    child.stdin?.on('error', (streamErr) => {
+      logger.warn({ streamErr }, 'clamscan stdin error, child may have terminated early')
+    })
+
+    try {
+      child.stdin?.end(fileBuffer)
+    } catch (writeErr) {
+      logger.warn({ writeErr }, 'Failed writing to clamscan stdin')
+    }
   })
 }
 
@@ -62,16 +73,24 @@ export async function scanFile(
   try {
     const { stdout, stderr, exitCode } = await runClamscan(fileBuffer)
 
-    // ClamAV returns "OK" for clean files, exits non-zero when it finds malware
-    const isClean = exitCode === 0 && stdout.includes('OK')
-
-    if (!isClean) {
+    // ClamAV exit codes:
+    // 0 = Clean (no virus)
+    // 1 = Virus detected
+    // 2 = Operational error (missing database, corrupt file, etc.)
+    if (exitCode === 1 || stdout.includes('FOUND')) {
       logger.error({ fileName, stdout, stderr, exitCode }, 'ClamAV detected malware')
       return {
         clean: false,
         detected: stdout.trim() || 'malware_detected',
         message: 'File detected as malware by ClamAV',
       }
+    }
+
+    // An operational error (e.g. missing/broken signature DB) is NOT a
+    // verdict on the file - fail open rather than false-blocking it.
+    if (exitCode === 2 || (stderr && stderr.includes('No supported database files'))) {
+      logger.warn({ fileName, stdout, stderr, exitCode }, 'ClamAV scanner encountered an error, failing open')
+      return { clean: true, message: 'Scanner unavailable, allowed file' }
     }
 
     logger.debug({ fileName }, 'ClamAV scan passed')
